@@ -1,0 +1,173 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://raw.githubusercontent.com/sidebutton/sidebutton-harbor-agent/main/docs/arm-params.schema.json",
+  "title": "Terminal-Bench arm parameter block",
+  "description": "The parameter block that defines one benchmark arm (one clone of the Test epic → one `harbor run`). Set per arm so that calibration, cold, primed, Fable and submission arms are directly comparable and the campaign is repeatable for TB 2.2/3.0. See docs/RUNBOOK.md. The primed reference block is docs/arm-params.example.json; the cold path is docs/arm-params.cold.example.json.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "arm_label",
+    "account",
+    "workspace",
+    "agent_import_path",
+    "backend_model",
+    "reasoning_effort",
+    "priming",
+    "skill_packs",
+    "pack_repo_commit",
+    "dataset",
+    "k_trials",
+    "sandbox",
+    "concurrency",
+    "include_tasks",
+    "upload_public"
+  ],
+  "properties": {
+    "arm_label": {
+      "type": "string",
+      "pattern": "^[a-z0-9]+(-[a-z0-9]+)*$",
+      "description": "Unique slug naming this arm/clone. Lowercase alphanumerics and single hyphens.",
+      "examples": ["sidebutton-primed-opus48", "sidebutton-cold-opus48", "calibration-claude-code"]
+    },
+    "account": {
+      "type": "string",
+      "minLength": 1,
+      "default": "benchmarks",
+      "description": "SideButton account that owns every benchmark campaign (§5). One dedicated account; benchmark runs never touch the production fleet.",
+      "examples": ["benchmarks"]
+    },
+    "workspace": {
+      "type": "string",
+      "pattern": "^[a-z0-9]+(-[a-z0-9]+)*$",
+      "description": "Campaign workspace slug inside the account. One per campaign.",
+      "examples": ["tb-2-1", "tb-2-2", "swe-bench-mm"]
+    },
+    "agent_import_path": {
+      "type": "string",
+      "pattern": "^([A-Za-z_][A-Za-z0-9_]*(\\.[A-Za-z_][A-Za-z0-9_]*)*:[A-Za-z_][A-Za-z0-9_]*|[a-z][a-z0-9-]*)$",
+      "description": "How Harbor loads the agent. Our adapter is the Python `module:Class` import path passed via `--agent-import-path`. Stock arms (e.g. the calibration arm) use a bare Harbor agent name passed via `-a/--agent` — the pattern accepts both and is intentionally not a const so the calibration arm is representable. Must match the accepted set of the T1 adapter.",
+      "examples": ["sidebutton_harbor_agent:SidebuttonAgent", "claude-code", "oracle"]
+    },
+    "backend_model": {
+      "type": "string",
+      "pattern": "^[a-z0-9-]+/[A-Za-z0-9._-]+$",
+      "description": "Model backend as `provider/model` (LiteLLM-style). A pattern, not an enum, so new backends do not require a schema change; reconcile the exact accepted value with the T1 adapter.",
+      "examples": ["anthropic/claude-opus-4-8", "anthropic/claude-fable-5"]
+    },
+    "reasoning_effort": {
+      "enum": ["low", "medium", "high"],
+      "description": "Reasoning-effort tier handed to the adapter. Must match the T1 adapter's accepted set.",
+      "examples": ["high"]
+    },
+    "priming": {
+      "enum": ["cold", "primed"],
+      "description": "Whether the arm ships skill packs. Drives `skill_packs`: `cold` forces an empty pack set; `primed` requires at least one pack (enforced by the top-level if/then/else). The calibration arm is represented as `cold` (no packs) with a stock `agent_import_path`.",
+      "examples": ["primed", "cold"]
+    },
+    "skill_packs": {
+      "type": "array",
+      "uniqueItems": true,
+      "items": {
+        "enum": [
+          "sb-tb-ml",
+          "sb-tb-sci",
+          "sb-tb-build",
+          "sb-tb-sec",
+          "sb-tb-sys",
+          "sb-tb-data",
+          "sb-tb-algo",
+          "sb-tb-git"
+        ]
+      },
+      "description": "The domain-general packs (§7) exported into this public repo for the run. Must be `[]` when `priming` is `cold` and non-empty when `priming` is `primed` (enforced conditionally below).",
+      "examples": [
+        ["sb-tb-ml", "sb-tb-sci", "sb-tb-build", "sb-tb-sec", "sb-tb-sys", "sb-tb-data", "sb-tb-algo", "sb-tb-git"],
+        []
+      ]
+    },
+    "pack_repo_commit": {
+      "type": "string",
+      "minLength": 1,
+      "description": "The commit of the benchmarks pack repo that this arm's packs were exported from, recorded so any arm is re-creatable and drift is detectable (§5.3). Resolved value is a git SHA (7-40 hex chars, e.g. `1a2b3c4d5e6f7a8b9c0d1e2f3a4b5c6d7e8f9a0b`). Intentionally left an unconstrained string so the §10.1 reference block validates with its `<sha …>` placeholder as-is.",
+      "examples": ["1a2b3c4d5e6f7a8b9c0d1e2f3a4b5c6d7e8f9a0b", "<sha of the benchmarks pack repo at export>"]
+    },
+    "dataset": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Pinned dataset as `name@ref`, passed to `harbor run -d`. Resolved value pins an exact ref, e.g. `terminal-bench/terminal-bench-2-1@v2.1.0`. Intentionally left an unconstrained string so the §10.1 reference block validates with its `@<pinned-ref>` placeholder as-is. A submission must use the exact ref pinned in the dataset's `core/hub.py`.",
+      "examples": ["terminal-bench/terminal-bench-2-1@v2.1.0", "terminal-bench/terminal-bench-2-1@<pinned-ref>"]
+    },
+    "k_trials": {
+      "type": "integer",
+      "minimum": 1,
+      "description": "Trials per task. Calibration ramps 1→5; a submission requires ≥5 (the board reports mean reward over ≥5 trials).",
+      "examples": [5]
+    },
+    "sandbox": {
+      "enum": ["docker", "daytona", "local"],
+      "description": "Execution sandbox (§4): `docker`/`local` for smoke runs, `daytona` for parallel full runs (needs `DAYTONA_API_KEY`). Passed to `harbor run --env`.",
+      "examples": ["daytona"]
+    },
+    "concurrency": {
+      "type": "integer",
+      "minimum": 1,
+      "description": "Parallel task workers, passed to `harbor run --n-concurrent`.",
+      "examples": [16]
+    },
+    "include_tasks": {
+      "description": "Task selection: the string `\"all\"` for the full 89-task set, or an explicit list of task names for cheap subset iteration (`--include-task-name`). A submission must be `\"all\"`.",
+      "oneOf": [
+        { "const": "all" },
+        {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": { "type": "string", "minLength": 1 }
+        }
+      ],
+      "examples": ["all", ["torch-pipeline-parallelism", "mcmc-sampling-stan"]]
+    },
+    "upload_public": {
+      "type": "boolean",
+      "description": "Whether trials are uploaded publicly to Harbor Hub (`--upload --public`). Iteration arms are `false`; a submission is `true`.",
+      "examples": [true, false]
+    }
+  },
+  "if": {
+    "properties": { "priming": { "const": "cold" } },
+    "required": ["priming"]
+  },
+  "then": {
+    "properties": {
+      "skill_packs": {
+        "const": [],
+        "description": "cold ⇒ no packs."
+      }
+    }
+  },
+  "else": {
+    "properties": {
+      "skill_packs": {
+        "minItems": 1,
+        "description": "primed ⇒ at least one pack."
+      }
+    }
+  },
+  "$defs": {
+    "submission": {
+      "title": "Submission-arm profile",
+      "$comment": "A submission clone must be all tasks × ≥5 trials × public upload (§10.1). This cannot be inferred from the 15 fields alone (a calibration arm can also be all×5), so it is a separate profile validated in ADDITION to the base schema for the submission arm only — never forced globally, which would break subset/iteration arms. Mirrored, self-contained, as docs/arm-params.submission.schema.json for a one-line check-jsonschema run.",
+      "allOf": [
+        { "$ref": "#" },
+        {
+          "properties": {
+            "include_tasks": { "const": "all" },
+            "k_trials": { "minimum": 5 },
+            "upload_public": { "const": true }
+          },
+          "required": ["include_tasks", "k_trials", "upload_public"]
+        }
+      ]
+    }
+  }
+}

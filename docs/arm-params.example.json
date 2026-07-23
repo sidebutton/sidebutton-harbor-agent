@@ -1,0 +1,18 @@
+{
+  "arm_label": "sidebutton-primed-opus48",
+  "account": "benchmarks",
+  "workspace": "tb-2-1",
+  "agent_import_path": "sidebutton_harbor_agent:SidebuttonAgent",
+  "backend_model": "anthropic/claude-opus-4-8",
+  "reasoning_effort": "high",
+  "priming": "primed",
+  "skill_packs": ["sb-tb-ml", "sb-tb-sci", "sb-tb-build", "sb-tb-sec",
+                  "sb-tb-sys", "sb-tb-data", "sb-tb-algo", "sb-tb-git"],
+  "pack_repo_commit": "<sha of the benchmarks pack repo at export>",
+  "dataset": "terminal-bench/terminal-bench-2-1@<pinned-ref>",
+  "k_trials": 5,
+  "sandbox": "daytona",
+  "concurrency": 16,
+  "include_tasks": "all",
+  "upload_public": true
+}
