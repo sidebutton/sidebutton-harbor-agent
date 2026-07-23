@@ -1,0 +1,17 @@
+# Python build / packaging
+build/
+dist/
+*.egg-info/
+src/*.egg-info/
+__pycache__/
+*.py[cod]
+
+# Virtualenvs
+.venv/
+venv/
+
+# Test / tooling caches
+.pytest_cache/
+.ruff_cache/
+.coverage
+htmlcov/

@@ -1,0 +1,49 @@
+# CI workflow for sidebutton-harbor-agent.
+#
+# ACTIVATION (one-time, needs a token with the GitHub `workflow` scope):
+#   move this file to `.github/workflows/ci.yml`.
+# The automation account that opened the adapter PR has only the `repo` scope,
+# which GitHub forbids from creating files under `.github/workflows/`, so the
+# workflow is parked here. Its content is final — no edits needed on move.
+
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install (editable, with dev extras)
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e ".[dev]"
+
+      - name: Lint (ruff)
+        run: python -m ruff check .
+
+      - name: Unit tests (pytest, no container)
+        run: python -m pytest -q
+
+      - name: Dry-run entrypoint smoke (AC2)
+        run: |
+          sidebutton-harbor-agent-dryrun \
+            --model anthropic/claude-opus-4-8 --effort high
