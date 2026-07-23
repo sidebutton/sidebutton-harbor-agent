@@ -1,28 +1,142 @@
 # sidebutton-harbor-agent
 
-SideButton agent adapter for the [Harbor](https://github.com/harbor-framework/harbor) harness, targeting the
-[Terminal-Bench 2.1](https://github.com/harbor-framework/terminal-bench-2-1) leaderboard.
+SideButton agent adapter for the [Harbor](https://github.com/harbor-framework/harbor) harness,
+targeting the [Terminal-Bench 2.1](https://github.com/harbor-framework/terminal-bench-2-1)
+leaderboard.
 
-**Status: scaffolding.** The adapter implementation, bundled skill packs, and verify-loop config land here as
-the benchmark campaign's build phase executes. Nothing in this repo is runnable yet.
+Import path (Harbor `--agent`): **`sidebutton_harbor_agent:SidebuttonAgent`**
 
-## What this repo will contain
+## What it is
+
+The public `sidebutton` npm CLI is a *workflow / skill-pack* tool, not an autonomous coder. The
+"SideButton runtime" that competes on Terminal-Bench is therefore **a base coding agent (Claude
+Code) + SideButton skill packs + a verify-before-done loop**. This adapter models exactly that by
+subclassing Harbor's `ClaudeCode` installed agent, which means it inherits ATIF trajectory
+emission, provider error classification, and the model / effort / API-key plumbing unchanged.
+
+On top of the base agent it:
+
+- **installs the public SideButton CLI** (`npm i -g sidebutton@<pin>`) inside the task container;
+- **feeds the task's `instruction.md`** to the agent (inherited) and **appends the verify-loop
+  guidance** (`config/CLAUDE.md`) to it;
+- **loads any skill packs** present under `packs/` by flattening them into Claude Code's skills
+  directory. When `packs/` has no packs (the *cold arm*) this is a clean no-op;
+- sets **no** verifier, timeout, or resource overrides — runs stay on stock settings.
 
 | Component | Purpose |
 |---|---|
-| `sidebutton_harbor_agent/` | Harbor `InstalledAgent` adapter (import path `sidebutton_harbor_agent:SidebuttonAgent`). Installs the public SideButton CLI inside the task container, feeds it the task's `instruction.md`, and passes model / effort / API-key parameters. |
-| `packs/` | Domain-general skill packs (`sb-tb-*`), exported at a pinned commit from the authoring repo. The export commit is recorded per benchmark arm so any run is re-creatable. |
-| `config/CLAUDE.md` | The in-container verify-before-done loop: self-review against the task's acceptance criteria before finishing. |
+| `src/sidebutton_harbor_agent/agent.py` | `SidebuttonAgent(ClaudeCode)` — the adapter. |
+| `src/sidebutton_harbor_agent/dryrun.py` | `sidebutton-harbor-agent-dryrun` — prints & validates the in-container command line, no container. |
+| `src/sidebutton_harbor_agent/packs/` | Bundled skill packs (`sb-tb-*`). Empty for the cold arm; populated at a pinned commit by the pack-export tickets. |
+| `src/sidebutton_harbor_agent/config/CLAUDE.md` | The verify-before-done loop appended to the task instruction. Placeholder pending SCRUM-1836. |
 
-## Reproducibility & fairness
+## Install
 
-Everything a leaderboard maintainer needs to re-run a submission is public:
+```bash
+pip install "git+https://github.com/sidebutton/sidebutton-harbor-agent"
+# or, from a checkout:
+pip install -e ".[dev]"
+```
 
-- The SideButton CLI is public npm; the skill packs ship **in this repo** (never from a private registry).
-- Packs carry **domain-general competency only** (toolchain eras, idioms, debugging routines) — no
-  task-specific knowledge, nothing keyed to a task id, and pack discovery never reads the benchmark
-  dataset repo or its oracle solutions.
-- Runs use stock timeouts, resources, and verifiers; the verify loop is transparent for trajectory review.
+Requires Python ≥ 3.12 and `harbor >= 0.20, < 0.21` (installed automatically). Everything a
+leaderboard maintainer needs to re-run a submission is public and ships in this package: the CLI is
+public npm, the packs live in `packs/`, and the verify loop is `config/CLAUDE.md`.
+
+## Parameters (Terminal-Bench §10.1 clone-param block)
+
+Parameters map 1:1 to the base agent — no custom parsing:
+
+| §10.1 param | How to pass | In-container effect |
+|---|---|---|
+| backend model id | `--model anthropic/claude-opus-4-8` | `ANTHROPIC_MODEL` (provider prefix stripped for the official API) |
+| reasoning effort | `--agent-kwarg reasoning_effort=high` | `claude … --effort high` |
+| API key | host `ANTHROPIC_API_KEY`, or `--agent-env ANTHROPIC_API_KEY=…` | passed through to the CLI |
+| priming (cold vs primed) | populate / empty `packs/` (or `--agent-kwarg packs_dir=…`) | packs flattened into Claude Code skills, or no-op |
+
+Adapter-specific `--agent-kwarg`s: `packs_dir`, `sidebutton_cli_version`, `verify_loop`
+(`true`/`false`), `verify_loop_path`.
+
+## Dry run (no container) — AC2
+
+Inspect and validate exactly what would run in the container:
+
+```bash
+sidebutton-harbor-agent-dryrun --model anthropic/claude-opus-4-8 --effort high
+```
+
+```text
+agent:   sidebutton
+version: 0.1.0+cli.1.5.1
+model:   anthropic/claude-opus-4-8
+packs:   (none — cold arm)
+
+env (in-container):
+  ANTHROPIC_MODEL=claude-opus-4-8
+  CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1
+  IS_SANDBOX=1
+
+setup commands:
+  (none)
+
+agent command:
+  $ claude --verbose --output-format=stream-json --effort high --permission-mode=bypassPermissions --print
+
+dry-run OK — invocation is valid (no overrides, model & effort wired).
+```
+
+`--json` emits the same as machine-readable JSON (status line on stderr, so stdout stays pure).
+A non-zero exit means the invocation failed validation (e.g. an override token was present).
+
+## Operator smoke run (AC3 — manual, not agent-run)
+
+Run one Terminal-Bench task end-to-end on local Docker to confirm the adapter completes a trial
+and produces an ATIF trajectory. **Prerequisites:** Docker running, `harbor` installed, and
+`ANTHROPIC_API_KEY` exported.
+
+```bash
+export ANTHROPIC_API_KEY=sk-…
+
+harbor run \
+  --agent sidebutton_harbor_agent:SidebuttonAgent \
+  --dataset terminal-bench-2-1 \
+  --include-task-name hello-world \
+  --model anthropic/claude-opus-4-8 \
+  --agent-kwarg reasoning_effort=high \
+  -k 1
+```
+
+`--agent-import-path` is the deprecated spelling of `--agent`; both resolve the same import path.
+
+**Expect:** the run reaches a verifier reward for the task, and an ATIF `trajectory_path` is written
+under the run's trial directory (inherited from the Claude Code base — that trajectory is what the
+leaderboard submission uploads). Pick any quick task with `--include-task-name`.
+
+## Fairness & reproducibility
+
+- **Public everything.** SideButton CLI is public npm; packs ship in this repo (never a private
+  registry); the verify loop is `config/CLAUDE.md` in-tree and transparent for trajectory review.
+- **No overrides.** The adapter sets no verifier, timeout, or resource overrides; the dry-run
+  validator and the unit tests assert their absence. Runs use stock timeouts and resources.
+- **Domain-general packs only.** Packs carry competency (toolchain eras, idioms, debugging
+  routines), never task-specific knowledge or anything keyed to a task id; pack discovery never
+  reads the benchmark dataset or its oracle solutions.
+- **Robustness.** A pack-layer failure degrades to the base agent rather than erroring the trial —
+  a flaky layer must never cost a reward.
+- **Pinned & recorded.** `version()` reports `<adapter>+cli.<sidebutton-cli-version>`; the packs'
+  export commit is recorded per benchmark arm, so any run is re-creatable.
+
+## Development
+
+```bash
+pip install -e ".[dev]"
+ruff check .
+pytest -q
+```
+
+CI (ruff + pytest on Python 3.12 & 3.13 + the dry-run smoke) is defined in
+[`ci/ci.yml`](ci/ci.yml). Move it to `.github/workflows/ci.yml` to activate it —
+it is parked outside `.github/workflows/` only because the automation account
+that opened the adapter PR lacks the GitHub `workflow` token scope.
 
 ## License
 
