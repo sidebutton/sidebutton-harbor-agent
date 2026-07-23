@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import importlib.resources
 import os
+import re
 import shlex
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
@@ -59,6 +60,11 @@ FORBIDDEN_OVERRIDE_TOKENS = (
     "--gpus",
     "--resource",
 )
+
+#: Matches HTML comments (``<!-- ... -->``, possibly multi-line). The verify-loop
+#: file is authored comment-free, but the loader strips these defensively so a
+#: stray developer-only note can never leak verbatim into the agent's prompt.
+_HTML_COMMENT_RE = re.compile(r"<!--.*?-->", re.DOTALL)
 
 
 @dataclass
@@ -196,7 +202,8 @@ class SidebuttonAgent(ClaudeCode):
         value is inserted unquoted into the shell command and cannot carry
         multi-line content, and not a ``CLAUDE.md`` file, whose discovery is
         unreliable once ``CLAUDE_CONFIG_DIR`` is overridden by the base ``run()``).
-        Real content lands in B3 / SCRUM-1836; this wires the mechanism.
+        The guidance itself lives in ``config/CLAUDE.md`` (loaded, comment-stripped,
+        by :meth:`_load_verify_loop_text`).
         """
         rendered = super().render_instruction(instruction)
         if self._verify_loop_enabled and self._verify_loop_text:
@@ -303,13 +310,25 @@ class SidebuttonAgent(ClaudeCode):
     ) -> str:
         try:
             if verify_loop_path:
-                return Path(verify_loop_path).read_text(encoding="utf-8").strip()
-            packaged = importlib.resources.files("sidebutton_harbor_agent").joinpath(
-                "config", "CLAUDE.md"
-            )
-            return packaged.read_text(encoding="utf-8").strip()
+                raw = Path(verify_loop_path).read_text(encoding="utf-8")
+            else:
+                packaged = importlib.resources.files(
+                    "sidebutton_harbor_agent"
+                ).joinpath("config", "CLAUDE.md")
+                raw = packaged.read_text(encoding="utf-8")
         except (FileNotFoundError, ModuleNotFoundError, OSError):
             return ""
+        return self._sanitize_verify_loop_text(raw)
+
+    @staticmethod
+    def _sanitize_verify_loop_text(raw: str) -> str:
+        """Prepare raw file text for injection into the prompt.
+
+        Strips HTML comments so developer-only notes never reach the agent
+        verbatim (only whitespace was trimmed before, which leaked the placeholder
+        header), then trims surrounding whitespace.
+        """
+        return _HTML_COMMENT_RE.sub("", raw).strip()
 
     # ------------------------------------------------------------- dry-run seam
     def build_invocation(
