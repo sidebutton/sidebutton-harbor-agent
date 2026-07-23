@@ -28,7 +28,7 @@ On top of the base agent it:
 | `src/sidebutton_harbor_agent/agent.py` | `SidebuttonAgent(ClaudeCode)` — the adapter. |
 | `src/sidebutton_harbor_agent/dryrun.py` | `sidebutton-harbor-agent-dryrun` — prints & validates the in-container command line, no container. |
 | `src/sidebutton_harbor_agent/packs/` | Bundled skill packs (`sb-tb-*`). Empty for the cold arm; populated at a pinned commit by the pack-export tickets. |
-| `src/sidebutton_harbor_agent/config/CLAUDE.md` | The verify-before-done loop appended to the task instruction. Placeholder pending SCRUM-1836. |
+| `src/sidebutton_harbor_agent/config/CLAUDE.md` | The verify-before-done loop appended to every task instruction: enumerate the stated acceptance criteria and check each against real behavior, reproduce-before-fix for bug-shaped tasks, and "hidden tests exist — your own verification is the only signal". Domain-general and transparent for trajectory review. |
 | `docs/` | Campaign operator docs — per-arm parameter schema + operator runbook (see [Running a benchmark arm](#running-a-benchmark-arm)). |
 
 ## Running a benchmark arm
