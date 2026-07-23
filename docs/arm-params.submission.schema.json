@@ -1,0 +1,23 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://raw.githubusercontent.com/sidebutton/sidebutton-harbor-agent/main/docs/arm-params.submission.schema.json",
+  "title": "Terminal-Bench submission-arm overlay",
+  "$comment": "Self-contained overlay mirroring arm-params.schema.json#/$defs/submission. Run it AFTER the base schema (which enforces all 15 fields and additionalProperties:false); this file only tightens the three submission invariants so `check-jsonschema` needs no cross-file $ref. Keep in sync with #/$defs/submission in arm-params.schema.json.",
+  "type": "object",
+  "properties": {
+    "include_tasks": {
+      "const": "all",
+      "description": "A submission covers all 89 tasks — no cherry-picking."
+    },
+    "k_trials": {
+      "type": "integer",
+      "minimum": 5,
+      "description": "A submission runs ≥5 trials per task."
+    },
+    "upload_public": {
+      "const": true,
+      "description": "A submission's trials are uploaded publicly to Harbor Hub."
+    }
+  },
+  "required": ["include_tasks", "k_trials", "upload_public"]
+}

@@ -29,6 +29,26 @@ On top of the base agent it:
 | `src/sidebutton_harbor_agent/dryrun.py` | `sidebutton-harbor-agent-dryrun` — prints & validates the in-container command line, no container. |
 | `src/sidebutton_harbor_agent/packs/` | Bundled skill packs (`sb-tb-*`). Empty for the cold arm; populated at a pinned commit by the pack-export tickets. |
 | `src/sidebutton_harbor_agent/config/CLAUDE.md` | The verify-before-done loop appended to the task instruction. Placeholder pending SCRUM-1836. |
+| `docs/` | Campaign operator docs — per-arm parameter schema + operator runbook (see [Running a benchmark arm](#running-a-benchmark-arm)). |
+
+## Running a benchmark arm
+
+An *arm* is one clone of the Test epic carrying a parameter block that drives a single `harbor run`.
+The durable definition of an arm — the parameter schema and the operator runbook — lives under `docs/`:
+
+| Doc | Purpose |
+|---|---|
+| [`docs/RUNBOOK.md`](docs/RUNBOOK.md) | Operator runbook: author the 89-task epic, clone per arm, fill + validate the parameter block, `harbor run` per arm type, record results, gate, and submit. Executable after the epic B2 bring-up. |
+| [`docs/arm-params.schema.json`](docs/arm-params.schema.json) | JSON Schema (draft 2020-12) for the per-arm parameter block: 15 fields, `cold ⇒ no packs` / `primed ⇒ packs` rule, and a `#/$defs/submission` profile for the all × ≥5 × public submission arm. |
+| [`docs/arm-params.example.json`](docs/arm-params.example.json) · [`.cold.`](docs/arm-params.cold.example.json) · [`.submission.`](docs/arm-params.submission.example.json) | Reference parameter blocks (primed / cold / submission) doubling as validation fixtures. |
+
+Validate a parameter block:
+
+```bash
+check-jsonschema --schemafile docs/arm-params.schema.json arm.json
+# submission arm additionally:
+check-jsonschema --schemafile docs/arm-params.submission.schema.json arm.json
+```
 
 ## Install
 
