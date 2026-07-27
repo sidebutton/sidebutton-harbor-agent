@@ -15,7 +15,7 @@ from pathlib import Path
 import pytest
 from conftest import TB_PACK_NAMES, commit_all, make_pack_source
 
-from sidebutton_harbor_agent.pack_check import check, check_offline, main
+from sidebutton_harbor_agent.pack_check import check, check_offline, main, split_credentials
 from sidebutton_harbor_agent.pack_export import MANIFEST_NAME, export_packs
 
 
@@ -160,6 +160,13 @@ def test_offline_red_on_a_missing_field(exported: Path) -> None:
 def test_offline_red_on_unparseable_json(exported: Path) -> None:
     (exported / MANIFEST_NAME).write_text("{not json", encoding="utf-8")
     assert "not valid JSON" in _problems(check_offline(exported))
+
+
+def test_offline_red_on_a_manifest_that_is_not_utf8(exported: Path) -> None:
+    """A UnicodeDecodeError is not a JSONDecodeError: unhandled, it takes the CI
+    drift job down with a traceback instead of a readable FAIL."""
+    (exported / MANIFEST_NAME).write_bytes(b'{"schema": 1, "source_repo": "\xff\xfe"}')
+    assert "not valid UTF-8" in _problems(check_offline(exported))
 
 
 def test_offline_red_on_a_path_outside_the_pack_list(exported: Path) -> None:
@@ -338,6 +345,65 @@ def test_full_is_skipped_and_said_so_when_offline_already_failed(
     report = check(exported, source=pack_source.path)
     assert not report.ok
     assert "offline stage already failed" in report.mode
+
+
+# ------------------------------------------------------- fetch (credentialed)
+@pytest.mark.parametrize(
+    ("url", "env_token", "expected"),
+    [
+        # A token from the env is paired with the default user, never inlined.
+        ("https://host/12.git", "envtok", ("https://x-access-token@host/12.git", "envtok")),
+        # A credential embedded in the URL moves out of it (off git's argv).
+        ("https://u:tok@host/12.git", "", ("https://u@host/12.git", "tok")),
+        # A username with no secret is not a credential — and not to be dropped.
+        ("https://u@host/12.git", "", ("https://u@host/12.git", "")),
+        # Non-HTTP transports carry no basic-auth userinfo to relocate.
+        ("file:///tmp/pack-repo", "envtok", ("file:///tmp/pack-repo", "envtok")),
+        ("git@github.com:sidebutton/x.git", "envtok", ("git@github.com:sidebutton/x.git", "envtok")),
+    ],
+)
+def test_split_credentials(url: str, env_token: str, expected: tuple[str, str]) -> None:
+    assert split_credentials(url, env_token, "x-access-token") == expected
+
+
+def test_fetch_mode_clones_and_compares(exported: Path, pack_source, monkeypatch) -> None:
+    """The credentialed path end-to-end over a local URL: real clone, real
+    re-export, real byte-diff — only the HTTP auth is out of reach offline."""
+    monkeypatch.setenv("SB_PACK_REPO_URL", f"file://{pack_source.path}")
+    monkeypatch.delenv("SB_PACK_REPO_TOKEN", raising=False)
+
+    report = check(exported, fetch=True)
+    assert report.ok, _problems(report)
+    assert report.mode.startswith("full (fetch")
+
+
+def test_fetch_mode_is_red_on_a_hand_edit(exported: Path, pack_source, monkeypatch) -> None:
+    monkeypatch.setenv("SB_PACK_REPO_URL", f"file://{pack_source.path}")
+    target = exported / "sb-tb-sci" / "idioms" / "_skill.md"
+    target.write_text("rewritten\n", encoding="utf-8")
+    manifest = _load(exported)
+    manifest["files"]["sb-tb-sci/idioms/_skill.md"] = hashlib.sha256(
+        target.read_bytes()
+    ).hexdigest()
+    _save(exported, manifest)
+
+    report = check(exported, fetch=True)
+    assert not report.ok
+    assert "content differs from the recorded commit" in _problems(report)
+
+
+def test_fetch_failure_never_leaks_the_token(exported: Path, monkeypatch, capsys) -> None:
+    """An unreachable host fails loudly, and neither the report nor the JSON
+    output carries the secret into a public CI log."""
+    monkeypatch.setenv("SB_PACK_REPO_URL", "https://x-access-token:ghp_SECRET123@127.0.0.1:1/12.git")
+    monkeypatch.delenv("SB_PACK_REPO_TOKEN", raising=False)
+
+    code = main(["--packs-dir", str(exported), "--fetch", "--json"])
+    captured = capsys.readouterr()
+
+    assert code == 1
+    assert "ghp_SECRET123" not in captured.out + captured.err
+    assert "127.0.0.1" in json.loads(captured.out)["mode"]
 
 
 # ---------------------------------------------------------------------- CLI

@@ -279,6 +279,62 @@ def test_symlinks_in_the_source_are_refused(tmp_path: Path, pack_source) -> None
         export_packs(source=pack_source.path, dest=tmp_path / "packs")
 
 
+def test_a_failed_reexport_leaves_the_previous_export_intact(tmp_path: Path, pack_source) -> None:
+    """All-or-nothing. A refusal *after* the mirror would otherwise empty packs/
+    while leaving the manifest describing packs that are no longer there — a
+    committed state the repo's own drift guard reports as invalid."""
+    dest = tmp_path / "packs"
+    export_packs(source=pack_source.path, dest=dest)
+    before = _tree(dest)
+
+    # The source gains something the export refuses.
+    (pack_source.path / "sb-tb-ml" / "linked.md").symlink_to("../../FAIRNESS.md")
+    commit_all(pack_source.path, "feat(packs): add a link")
+    with pytest.raises(PackExportError, match="refusing to export symlinks"):
+        export_packs(source=pack_source.path, dest=dest)
+
+    assert _tree(dest) == before, "a failed re-export must not touch the committed export"
+
+
+def test_a_symlinked_dir_in_dest_is_replaced_not_a_crash(tmp_path: Path, pack_source) -> None:
+    """``rmtree`` refuses a symlink, so an unguarded mirror delete died with a
+    bare OSError halfway through — after deleting the packs sorted before it."""
+    dest = tmp_path / "packs"
+    dest.mkdir()
+    (dest / "zz-linked").symlink_to(pack_source.path)
+
+    export_packs(source=pack_source.path, dest=dest)
+
+    assert not (dest / "zz-linked").exists()
+    # The link was unlinked, never followed: its target is untouched.
+    assert (pack_source.path / "sb-tb-algo" / "_skill.md").is_file()
+
+
+def test_hidden_dirs_do_not_survive_the_mirror_write(tmp_path: Path, pack_source) -> None:
+    """The loader skips dot-dirs but ``_stage_packs`` uploads them, and the drift
+    guard rejects them — so a fresh export has to clear them too."""
+    from sidebutton_harbor_agent.pack_check import check_offline
+
+    dest = tmp_path / "packs"
+    dest.mkdir()
+    (dest / ".hidden-pack").mkdir()
+    (dest / ".hidden-pack" / "SKILL.md").write_text("invisible to the loader\n", encoding="utf-8")
+
+    export_packs(source=pack_source.path, dest=dest)
+
+    assert not (dest / ".hidden-pack").exists()
+    report = check_offline(dest)
+    assert report.ok, "a fresh export must satisfy this repo's own drift guard"
+
+
+def test_out_of_range_source_date_epoch_errors_cleanly(tmp_path: Path, pack_source, monkeypatch):
+    """An integer that is not a representable date is the same operator mistake
+    as a non-integer, and gets the same actionable error (not a traceback)."""
+    monkeypatch.setenv("SOURCE_DATE_EPOCH", "99999999999999")
+    with pytest.raises(PackExportError, match="SOURCE_DATE_EPOCH"):
+        export_packs(source=pack_source.path, dest=tmp_path / "packs")
+
+
 # ---------------------------------------------------------------- one-way rule
 @pytest.mark.parametrize("subcommand", ["push", "commit", "send-pack", "update-ref", "tag"])
 def test_write_subcommands_are_refused(subcommand: str) -> None:

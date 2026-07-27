@@ -38,6 +38,7 @@ import shutil
 import subprocess
 import sys
 import tarfile
+import tempfile
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -271,7 +272,12 @@ def export_timestamp() -> str:
         seconds = int(epoch)
     except ValueError as exc:
         raise PackExportError(f"SOURCE_DATE_EPOCH is not an integer: {epoch!r}") from exc
-    return datetime.fromtimestamp(seconds, UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+    try:
+        return datetime.fromtimestamp(seconds, UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+    except (ValueError, OverflowError, OSError) as exc:
+        # An integer that is not a representable date — same operator mistake,
+        # so it deserves the same message rather than a traceback.
+        raise PackExportError(f"SOURCE_DATE_EPOCH is out of range: {epoch!r}") from exc
 
 
 def build_manifest(
@@ -310,6 +316,10 @@ def read_manifest(dest: Path) -> dict[str, Any] | None:
         return None
     try:
         return json.loads(path.read_text(encoding="utf-8"))
+    except UnicodeDecodeError as exc:
+        # Not a JSONDecodeError: without this the drift guard dies with a
+        # traceback instead of reporting a FAIL an operator can read.
+        raise PackExportError(f"{path} is not valid UTF-8: {exc}") from exc
     except json.JSONDecodeError as exc:
         raise PackExportError(f"{path} is not valid JSON: {exc}") from exc
 
@@ -324,6 +334,22 @@ def pack_dirs(dest: Path) -> list[str]:
     if not dest.is_dir():
         return []
     return sorted(p.name for p in dest.iterdir() if p.is_dir() and not p.name.startswith("."))
+
+
+def stale_export_entries(dest: Path) -> list[Path]:
+    """Entries a previous export owns, which a new one replaces wholesale.
+
+    Every directory under ``dest`` is pack content — *including* a hidden or
+    symlinked one. :func:`pack_dirs` deliberately hides those from the adapter's
+    view (it mirrors ``pack_skill_dirs``), but a mirror write still has to clear
+    them: leaving one behind emits a freshly exported tree that this repo's own
+    drift guard then rejects, and ``_stage_packs`` uploads the whole directory
+    into the task container regardless of what the loader sees.
+
+    Regular files are left alone: they are adapter-owned (``README.md``) or
+    rewritten by this export (the manifest).
+    """
+    return [p for p in sorted(dest.iterdir()) if p.is_symlink() or p.is_dir()]
 
 
 # ------------------------------------------------------------------------ export
@@ -342,9 +368,13 @@ def export_packs(
 ) -> ExportResult:
     """Mirror the pinned ``sb-tb-*`` packs from ``source`` into ``dest``.
 
-    Mirror semantics: existing pack **subdirectories** in ``dest`` are removed
-    first (so a pack deleted upstream disappears here too), while loose files —
+    Mirror semantics: every **directory** in ``dest`` is replaced (so a pack
+    deleted upstream disappears here too, and a hidden or symlinked one a
+    hand-edit left behind does not survive a re-export), while loose files —
     ``README.md``, and the manifest we are about to rewrite — are preserved.
+
+    All-or-nothing: the export is staged in full and swapped in only once it is
+    complete, so a failure leaves ``dest`` exactly as it was.
     """
     dest = dest or default_dest()
     sha = resolve_commit(source, ref)
@@ -363,33 +393,51 @@ def export_packs(
             f"could not determine the source repo URL from {source} "
             "(no 'origin' remote) — pass --repo-url explicitly"
         )
-    date = export_timestamp()  # resolved before writing: a bad value must not half-export
+    # Everything that can fail is resolved before a single byte of dest changes:
+    # a half-export is worse than none.
+    date = export_timestamp()
     expected = tree_files(source, sha, packs)
+    committed = commit_date(source, sha)
 
     dest.mkdir(parents=True, exist_ok=True)
-    for stale in pack_dirs(dest):
-        shutil.rmtree(dest / stale)
-    extract_packs(source, sha, packs, dest)
+    # Stage the complete export beside dest, then swap it in. Extraction refuses
+    # links and the mirror-faithfulness check below can reject the archive —
+    # doing either after clearing dest would leave packs/ emptied, with a stale
+    # manifest still describing the packs that are no longer there.
+    with tempfile.TemporaryDirectory(prefix=".sb-pack-export-", dir=dest.parent) as tmp:
+        staging = Path(tmp) / "packs"
+        staging.mkdir()
+        extract_packs(source, sha, packs, staging)
 
-    files = hash_files(dest, packs)
-    if set(files) != expected:
-        missing = sorted(expected - set(files))
-        raise PackExportError(
-            "export is not a faithful mirror of the tree — "
-            f"{len(missing)} file(s) in the source are missing from the archive "
-            f"(a .gitattributes export-ignore?): {', '.join(missing[:5])}"
+        files = hash_files(staging, packs)
+        if set(files) != expected:
+            missing = sorted(expected - set(files))
+            raise PackExportError(
+                "export is not a faithful mirror of the tree — "
+                f"{len(missing)} file(s) in the source are missing from the archive "
+                f"(a .gitattributes export-ignore?): {', '.join(missing[:5])}"
+            )
+
+        manifest = build_manifest(
+            source_repo=scrub_url(recorded_url),
+            source_commit=sha,
+            source_commit_date=committed,
+            export_date=date,
+            packs=packs,
+            pack_glob=glob,
+            files=files,
         )
+        (staging / MANIFEST_NAME).write_text(serialize_manifest(manifest), encoding="utf-8")
 
-    manifest = build_manifest(
-        source_repo=scrub_url(recorded_url),
-        source_commit=sha,
-        source_commit_date=commit_date(source, sha),
-        export_date=date,
-        packs=packs,
-        pack_glob=glob,
-        files=files,
-    )
-    (dest / MANIFEST_NAME).write_text(serialize_manifest(manifest), encoding="utf-8")
+        for stale in stale_export_entries(dest):
+            # rmtree refuses a symlink, and following one would delete outside
+            # packs/ — unlink the link itself and leave its target alone.
+            if stale.is_symlink():
+                stale.unlink()
+            else:
+                shutil.rmtree(stale)
+        for entry in sorted(staging.iterdir()):
+            shutil.move(str(entry), str(dest / entry.name))
     return ExportResult(dest=dest, manifest=manifest)
 
 

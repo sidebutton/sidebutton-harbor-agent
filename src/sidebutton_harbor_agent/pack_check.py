@@ -357,12 +357,16 @@ def split_credentials(url: str, token: str, user: str) -> tuple[str, str]:
         return url, token
     parts = urlsplit(url)
     host = parts.netloc
+    named_user = False
     if "@" in host:
         userinfo, host = host.rsplit("@", 1)
         embedded_user, _, embedded_token = userinfo.partition(":")
         user = embedded_user or user
         token = embedded_token or token
-    netloc = f"{user}@{host}" if token else host
+        # A username the operator spelled out selects the account git
+        # authenticates as; only the *password* half is a secret to relocate.
+        named_user = bool(embedded_user)
+    netloc = f"{user}@{host}" if (token or named_user) else host
     return urlunsplit((parts.scheme, netloc, parts.path, parts.query, parts.fragment)), token
 
 

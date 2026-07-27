@@ -212,8 +212,10 @@ sidebutton-harbor-agent-check-packs
 The export reads the **committed** tree (`git archive` at the pinned commit), so a dirty checkout
 cannot leak uncommitted content into a public repo, and it selects exactly the top-level `sb-tb-*`
 directories — the generator scripts, `index.json` and any seeded example pack stay behind. Writes are
-mirror-shaped: pack subdirectories are replaced wholesale (a pack dropped upstream disappears here
-too) while loose files like this repo's `packs/README.md` are preserved. Exported pack **content is
+mirror-shaped: every directory under `packs/` is replaced wholesale (a pack dropped upstream
+disappears here too) while loose files like this repo's `packs/README.md` are preserved. The whole
+export is staged first and swapped in only once it is complete, so a run that fails validation leaves
+the committed export exactly as it was. Exported pack **content is
 bit-identical to the authored source** — including registry metadata such as `skill-pack.json`'s
 `"private": true`, which reads oddly in a public repo but is what "frozen mirror" means — so
 re-exporting the same commit is byte-for-byte reproducible. Links are refused rather than exported:
