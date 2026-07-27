@@ -36,10 +36,12 @@ import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit, urlunsplit
 
 from sidebutton_harbor_agent.pack_export import (
     MANIFEST_NAME,
     MANIFEST_SCHEMA,
+    PACK_GLOB,
     PackExportError,
     _git,
     default_dest,
@@ -67,6 +69,13 @@ DEFAULT_REPO_USER = "x-access-token"
 
 _FULL_SHA_RE = re.compile(r"^[0-9a-f]{40}$")
 
+#: Loose files this repo owns in ``packs/``. Everything else at the top level is
+#: neither exported nor adapter-owned — and ``_stage_packs`` uploads the whole
+#: directory into the task container, so an unreviewed file left here would ride
+#: along without ever passing the export. Hidden directories are caught for the
+#: same reason: the loader skips them, the upload does not.
+ALLOWED_LOOSE_FILES = frozenset({"README.md", MANIFEST_NAME})
+
 #: Manifest keys compared field-wise in full mode. ``export_date`` is excluded on
 #: purpose — it is wall-clock provenance, not content, so re-exporting the same
 #: commit tomorrow is not drift.
@@ -75,6 +84,7 @@ _COMPARED_MANIFEST_KEYS = (
     "source_repo",
     "source_commit",
     "source_commit_date",
+    "pack_glob",
     "packs",
     "files",
 )
@@ -135,7 +145,7 @@ def _validate_manifest_shape(manifest: Any) -> list[str]:
         # a newer exporter may mean something different by the same key.
         return [f"unsupported {MANIFEST_NAME} schema {schema!r} (expected {MANIFEST_SCHEMA})"]
 
-    for key in ("source_repo", "source_commit", "source_commit_date", "export_date"):
+    for key in ("source_repo", "source_commit", "source_commit_date", "export_date", "pack_glob"):
         if not isinstance(manifest.get(key), str) or not manifest[key]:
             problems.append(f"{MANIFEST_NAME}: missing or empty {key!r}")
 
@@ -171,6 +181,35 @@ def _validate_recorded_paths(files: dict[str, str], packs: list[str]) -> list[st
     return problems
 
 
+def unexpected_entries(packs_dir: Path, packs: list[str]) -> list[str]:
+    """Anything under ``packs/`` the export could not have produced.
+
+    Covers the two shapes the hash map alone cannot see, both of which are
+    uploaded into the task container by ``_stage_packs``: a link (never hashed,
+    never byte-compared — the export refuses them at the source, so one here was
+    added by hand) and top-level content that is not a pack.
+    """
+    problems: list[str] = []
+    for entry in sorted(packs_dir.iterdir()):
+        rel = entry.name
+        if entry.is_symlink():
+            problems.append(f"unexpected link under packs/: {rel}")
+        elif entry.is_dir():
+            if rel.startswith("."):
+                problems.append(f"hidden directory under packs/: {rel}")
+        elif rel not in ALLOWED_LOOSE_FILES:
+            problems.append(f"unexpected loose file under packs/: {rel}")
+
+    for pack in packs:
+        for path in sorted((packs_dir / pack).rglob("*")):
+            rel = path.relative_to(packs_dir).as_posix()
+            if path.is_symlink():
+                problems.append(f"unexpected link under packs/: {rel}")
+            elif not path.is_dir() and not path.is_file():
+                problems.append(f"not a regular file under packs/: {rel}")
+    return problems
+
+
 def check_offline(packs_dir: Path) -> CheckReport:
     """Validate the bundled export against its own manifest. No source needed."""
     report = CheckReport(packs_dir=packs_dir, mode="offline (manifest consistency)")
@@ -182,6 +221,9 @@ def check_offline(packs_dir: Path) -> CheckReport:
 
     present = pack_dirs(packs_dir)
     report.packs = present
+    # Runs before the cold-state shortcut: junk left in an empty packs/ still
+    # ships into the container.
+    report.problems.extend(unexpected_entries(packs_dir, present))
     try:
         manifest = read_manifest(packs_dir)
     except PackExportError as exc:
@@ -261,6 +303,9 @@ def compare_with_source(packs_dir: Path, manifest: dict[str, Any], source: Path)
                 # Carry the recorded URL through, so an operator checkout whose
                 # origin differs (mirror, local path) is not reported as drift.
                 repo_url=manifest["source_repo"],
+                # ...and the recorded selection, so a non-default --pack-glob
+                # export is compared against the same set it was made from.
+                glob=manifest.get("pack_glob", PACK_GLOB),
             )
         except PackExportError as exc:
             return [f"could not re-export {manifest['source_commit'][:12]} from {source}: {exc}"]
@@ -299,6 +344,28 @@ def _askpass_env(workdir: Path, token: str) -> dict[str, str]:
     }
 
 
+def split_credentials(url: str, token: str, user: str) -> tuple[str, str]:
+    """Move any credential embedded in ``url`` out of the URL.
+
+    ``SB_PACK_REPO_URL`` may legitimately arrive as
+    ``https://user:token@host/12.git``; passing that straight to ``git clone``
+    would put the secret on the command line, where any process can read it out
+    of ``ps``. Returns ``(url_without_password, effective_token)`` — the caller
+    hands the token to git through ``GIT_ASKPASS`` instead.
+    """
+    if not url.startswith(("http://", "https://")):
+        return url, token
+    parts = urlsplit(url)
+    host = parts.netloc
+    if "@" in host:
+        userinfo, host = host.rsplit("@", 1)
+        embedded_user, _, embedded_token = userinfo.partition(":")
+        user = embedded_user or user
+        token = embedded_token or token
+    netloc = f"{user}@{host}" if token else host
+    return urlunsplit((parts.scheme, netloc, parts.path, parts.query, parts.fragment)), token
+
+
 def fetch_source(url: str, workdir: Path) -> Path:
     """Bare-clone the pack repo into ``workdir`` using the operator's credential.
 
@@ -306,21 +373,21 @@ def fetch_source(url: str, workdir: Path) -> Path:
     reason). The token is passed via ``GIT_ASKPASS`` and the clone is thrown away
     with the temp dir.
     """
-    token = os.environ.get(ENV_REPO_TOKEN, "")
-    user = os.environ.get(ENV_REPO_USER) or DEFAULT_REPO_USER
     target = workdir / "source.git"
+    clone_url, token = split_credentials(
+        url,
+        os.environ.get(ENV_REPO_TOKEN, ""),
+        os.environ.get(ENV_REPO_USER) or DEFAULT_REPO_USER,
+    )
 
     # Never let git fall back to an interactive prompt: in CI that is a hang,
     # not a failure.
     env: dict[str, str] = {"GIT_TERMINAL_PROMPT": "0"}
-    clone_url = url
     if token:
         env.update(_askpass_env(workdir, token))
-        if url.startswith(("http://", "https://")) and "@" not in url.split("//", 1)[1]:
-            scheme, rest = url.split("//", 1)
-            clone_url = f"{scheme}//{user}@{rest}"
 
-    _git(["clone", "--bare", "--quiet", clone_url, str(target)], env=env)
+    # ``--`` so a URL that looks like an option is never read as one.
+    _git(["clone", "--bare", "--quiet", "--", clone_url, str(target)], env=env)
     return target
 
 
@@ -360,7 +427,11 @@ def check(
         )
         return report
 
-    token = os.environ.get(ENV_REPO_TOKEN, "")
+    # The effective token may come from the env *or* from the URL itself — both
+    # have to be redacted from anything this prints.
+    _, token = split_credentials(
+        url, os.environ.get(ENV_REPO_TOKEN, ""), os.environ.get(ENV_REPO_USER) or DEFAULT_REPO_USER
+    )
     report.mode = f"full (fetch {scrub_url(url)})"
     with tempfile.TemporaryDirectory(prefix="sb-pack-fetch-") as tmp:
         try:

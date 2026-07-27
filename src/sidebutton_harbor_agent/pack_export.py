@@ -195,9 +195,32 @@ def discover_packs(source: Path, sha: str, glob: str = PACK_GLOB) -> list[str]:
     ``FAIRNESS.md``, ``scripts/``, the seeded example pack — is not a TB pack and
     is never exported.
     """
-    listing = _git(["ls-tree", "-d", "--name-only", "--full-tree", sha], cwd=source)
-    names = [line.strip() for line in listing.splitlines() if line.strip()]
+    # ``-z`` because git C-quotes non-ASCII names in its default output
+    # (``"sb-tb-caf\303\251"``), which would silently fail the glob and drop a
+    # pack from the export without a word.
+    listing = _git(["ls-tree", "-d", "--name-only", "-z", "--full-tree", sha], cwd=source)
+    names = [name for name in listing.split("\0") if name]
     return sorted(name for name in names if fnmatch.fnmatch(name, glob))
+
+
+def tree_files(source: Path, sha: str, packs: list[str]) -> set[str]:
+    """Every **blob** path under ``packs`` in the pinned tree.
+
+    Used to prove the archive we extracted is the whole tree: ``git archive``
+    honours ``export-ignore`` in ``.gitattributes``, so a file present in the
+    source could otherwise be dropped from a "frozen mirror" silently.
+    """
+    listing = _git(["ls-tree", "-r", "-z", "--full-tree", sha, "--", *packs], cwd=source)
+    paths: set[str] = set()
+    for record in listing.split("\0"):
+        if not record:
+            continue
+        meta, _, path = record.partition("\t")
+        fields = meta.split()
+        # <mode> <type> <oid>. Gitlinks (submodules) are not files to export.
+        if len(fields) >= 2 and fields[1] == "blob":
+            paths.add(path)
+    return paths
 
 
 def extract_packs(source: Path, sha: str, packs: list[str], dest: Path) -> None:
@@ -259,6 +282,7 @@ def build_manifest(
     export_date: str,
     packs: list[str],
     files: dict[str, str],
+    pack_glob: str = PACK_GLOB,
 ) -> dict[str, Any]:
     """Assemble the manifest with a fixed key order (part of byte-identity)."""
     return {
@@ -267,6 +291,9 @@ def build_manifest(
         "source_commit": source_commit,
         "source_commit_date": source_commit_date,
         "export_date": export_date,
+        # Recorded so the drift guard re-exports with the same selection an
+        # operator used; otherwise a non-default --pack-glob reads as drift.
+        "pack_glob": pack_glob,
         "packs": sorted(packs),
         "files": files,
     }
@@ -329,12 +356,29 @@ def export_packs(
         )
 
     recorded_url = repo_url if repo_url is not None else source_repo_url(source)
+    if not recorded_url:
+        # Writing an empty source_repo would produce a manifest this repo's own
+        # drift guard rejects; fail here, where the fix is obvious.
+        raise PackExportError(
+            f"could not determine the source repo URL from {source} "
+            "(no 'origin' remote) — pass --repo-url explicitly"
+        )
     date = export_timestamp()  # resolved before writing: a bad value must not half-export
+    expected = tree_files(source, sha, packs)
 
     dest.mkdir(parents=True, exist_ok=True)
     for stale in pack_dirs(dest):
         shutil.rmtree(dest / stale)
     extract_packs(source, sha, packs, dest)
+
+    files = hash_files(dest, packs)
+    if set(files) != expected:
+        missing = sorted(expected - set(files))
+        raise PackExportError(
+            "export is not a faithful mirror of the tree — "
+            f"{len(missing)} file(s) in the source are missing from the archive "
+            f"(a .gitattributes export-ignore?): {', '.join(missing[:5])}"
+        )
 
     manifest = build_manifest(
         source_repo=scrub_url(recorded_url),
@@ -342,7 +386,8 @@ def export_packs(
         source_commit_date=commit_date(source, sha),
         export_date=date,
         packs=packs,
-        files=hash_files(dest, packs),
+        pack_glob=glob,
+        files=files,
     )
     (dest / MANIFEST_NAME).write_text(serialize_manifest(manifest), encoding="utf-8")
     return ExportResult(dest=dest, manifest=manifest)

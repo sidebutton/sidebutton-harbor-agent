@@ -185,6 +185,59 @@ def test_offline_red_on_a_missing_packs_dir(tmp_path: Path) -> None:
     assert "does not exist" in _problems(check_offline(tmp_path / "absent"))
 
 
+# ------------------------------------------ what the hash map alone cannot see
+def test_offline_red_on_a_symlink_inside_a_pack(exported: Path) -> None:
+    """A link is never hashed and never byte-compared, but ``_stage_packs``
+    still uploads it into the task container — so it has to be caught here."""
+    (exported / "sb-tb-ml" / "notes.md").symlink_to("../../../../etc/passwd")
+
+    report = check_offline(exported)
+    assert not report.ok
+    assert "unexpected link under packs/: sb-tb-ml/notes.md" in _problems(report)
+
+
+def test_offline_red_on_a_symlinked_pack_dir(exported: Path) -> None:
+    (exported / "sb-tb-linked").symlink_to("/etc")
+
+    report = check_offline(exported)
+    assert not report.ok
+    assert "unexpected link under packs/" in _problems(report)
+
+
+def test_offline_red_on_an_unexported_loose_file(exported: Path) -> None:
+    """packs/ is uploaded wholesale — unreviewed text must not ride along."""
+    (exported / "EXTRA-PROMPT.md").write_text("hand-added guidance\n", encoding="utf-8")
+
+    report = check_offline(exported)
+    assert not report.ok
+    assert "unexpected loose file under packs/: EXTRA-PROMPT.md" in _problems(report)
+
+
+def test_offline_red_on_a_hidden_pack_dir(exported: Path) -> None:
+    """The loader skips dot-dirs; the upload does not."""
+    hidden = exported / ".hidden-pack"
+    hidden.mkdir()
+    (hidden / "SKILL.md").write_text("invisible to pack_skill_dirs\n", encoding="utf-8")
+
+    report = check_offline(exported)
+    assert not report.ok
+    assert "hidden directory under packs/: .hidden-pack" in _problems(report)
+
+
+def test_offline_red_on_junk_in_a_cold_packs_dir(tmp_path: Path) -> None:
+    """The cold state is not a free pass — it is still shipped as-is."""
+    cold = tmp_path / "packs"
+    cold.mkdir()
+    (cold / "sneaked.md").write_text("hand-added\n", encoding="utf-8")
+
+    assert "unexpected loose file" in _problems(check_offline(cold))
+
+
+def test_offline_allows_the_adapter_owned_readme(exported: Path) -> None:
+    assert (exported / "README.md").is_file()
+    assert check_offline(exported).ok
+
+
 # -------------------------------------------------------------------- full mode
 def test_full_green_on_a_clean_export(exported: Path, pack_source) -> None:
     report = check(exported, source=pack_source.path)

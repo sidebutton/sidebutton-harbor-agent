@@ -126,6 +126,26 @@ def test_repo_url_override_is_recorded(tmp_path: Path, pack_source) -> None:
     assert _manifest(dest)["source_repo"] == "https://elsewhere/12.git"
 
 
+def test_a_source_without_an_origin_fails_with_the_remedy(tmp_path: Path) -> None:
+    """Better than writing a manifest this repo's own drift guard then rejects."""
+    source = make_pack_source(tmp_path / "repo", origin="")
+    with pytest.raises(PackExportError, match="--repo-url"):
+        export_packs(source=source.path, dest=tmp_path / "packs")
+
+    # ...and it works once the operator supplies one.
+    export_packs(source=source.path, dest=tmp_path / "packs", repo_url="https://given/12.git")
+
+
+def test_pack_glob_is_recorded(tmp_path: Path, pack_source) -> None:
+    """So the drift guard re-exports with the same selection it was made from."""
+    dest = tmp_path / "packs"
+    export_packs(source=pack_source.path, dest=dest, glob="sb-tb-m*")
+    manifest = _manifest(dest)
+
+    assert manifest["pack_glob"] == "sb-tb-m*"
+    assert manifest["packs"] == ["sb-tb-ml"]
+
+
 # -------------------------------------------------------------- reproducibility
 def test_same_commit_yields_byte_identical_output(
     tmp_path: Path, pack_source, monkeypatch

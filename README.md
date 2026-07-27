@@ -213,9 +213,12 @@ The export reads the **committed** tree (`git archive` at the pinned commit), so
 cannot leak uncommitted content into a public repo, and it selects exactly the top-level `sb-tb-*`
 directories — the generator scripts, `index.json` and any seeded example pack stay behind. Writes are
 mirror-shaped: pack subdirectories are replaced wholesale (a pack dropped upstream disappears here
-too) while loose files like this repo's `packs/README.md` are preserved. Exported packs are
-**bit-identical to the authored source**, metadata included, which is why re-exporting the same
-commit is byte-for-byte reproducible.
+too) while loose files like this repo's `packs/README.md` are preserved. Exported pack **content is
+bit-identical to the authored source** — including registry metadata such as `skill-pack.json`'s
+`"private": true`, which reads oddly in a public repo but is what "frozen mirror" means — so
+re-exporting the same commit is byte-for-byte reproducible. Links are refused rather than exported:
+every file under `packs/` is a regular file with a recorded hash, which is what makes the guard below
+total.
 
 `packs/EXPORT.json` records the provenance an arm's parameter block needs — `source_commit` is the
 §10.1 `pack_repo_commit` — plus a sha256 per exported file:
