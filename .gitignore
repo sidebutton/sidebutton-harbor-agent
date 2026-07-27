@@ -21,3 +21,6 @@ htmlcov/
 # neither belongs in the repo.
 jobs/
 terminal-bench-2-1/
+
+# local dev venv (agent workspace)
+.venv-sb/

@@ -6,6 +6,8 @@ import asyncio
 from pathlib import Path
 
 from sidebutton_harbor_agent import SidebuttonAgent
+from sidebutton_harbor_agent.pack_check import check_offline
+from sidebutton_harbor_agent.pack_export import default_dest
 
 
 def _make_packs(root: Path, names: list[str]) -> Path:
@@ -19,12 +21,33 @@ def _make_packs(root: Path, names: list[str]) -> Path:
     return packs
 
 
-def test_cold_arm_bundled_packs_is_noop(tmp_path: Path) -> None:
-    # The bundled packs/ dir ships empty (only README) -> no packs.
-    agent = SidebuttonAgent(logs_dir=tmp_path, model_name="anthropic/claude-opus-4-8")
+def test_cold_arm_is_a_clean_noop(tmp_path: Path) -> None:
+    """A packs dir with no pack subdirectories -> the base agent, no staging.
+
+    Pinned against an *explicit* empty dir rather than the bundled one: the day a
+    real export lands in ``packs/`` the cold arm still has to work, and it is
+    then driven exactly like this (``--agent-kwarg packs_dir=<empty-dir>``).
+    """
+    empty = tmp_path / "empty-packs"
+    empty.mkdir()
+    (empty / "README.md").write_text("loose files are ignored\n")
+    agent = SidebuttonAgent(
+        logs_dir=tmp_path, model_name="anthropic/claude-opus-4-8", packs_dir=str(empty)
+    )
     assert agent.has_packs() is False
     assert agent.pack_skill_dirs() == []
     assert agent.build_invocation().packs == []
+
+
+def test_bundled_packs_dir_agrees_with_its_export_manifest() -> None:
+    """Whatever state the repo is in — cold, or carrying an export — the bundled
+    ``packs/`` and ``packs/EXPORT.json`` must not disagree.
+
+    This is the in-suite half of the drift guard: it holds today (cold) and keeps
+    holding once the real export at the pinned pack-repo commit is committed.
+    """
+    report = check_offline(default_dest())
+    assert report.ok, "; ".join(report.problems)
 
 
 def test_packs_present_are_discovered(tmp_path: Path) -> None:
@@ -82,7 +105,7 @@ def test_cli_version_override(tmp_path: Path, fake_env) -> None:
     )
     asyncio.run(agent.install(fake_env))
     assert any("sidebutton@1.6.0" in c for c in fake_env.commands())
-    assert agent.version() == "0.1.0+cli.1.6.0"
+    assert agent.version() == "0.2.0+cli.1.6.0"
 
 
 def test_pack_staging_failure_degrades_cleanly(tmp_path: Path, fake_env) -> None:

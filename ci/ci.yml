@@ -5,6 +5,12 @@
 # The automation account that opened the adapter PR has only the `repo` scope,
 # which GitHub forbids from creating files under `.github/workflows/`, so the
 # workflow is parked here. Its content is final — no edits needed on move.
+#
+# OPTIONAL SECRETS (the `packs` job below):
+#   SB_PACK_REPO_TOKEN — read credential for the private account pack repo.
+#   SB_PACK_REPO_URL   — its clone URL (defaults to the manifest's source_repo).
+# Both unset is a supported configuration: the drift guard then runs its
+# credential-less mode. Setting them upgrades it to the full re-export diff.
 
 name: CI
 
@@ -47,3 +53,35 @@ jobs:
         run: |
           sidebutton-harbor-agent-dryrun \
             --model anthropic/claude-opus-4-8 --effort high
+
+  # Drift guard: the bundled packs/ must still be a clean export of the pack-repo
+  # commit recorded in packs/EXPORT.json. The private-repo fetch is credential-
+  # gated, so this degrades to manifest-consistency validation when the secret is
+  # absent — which is the default for forks and for PRs from a fork.
+  packs:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e .
+
+      - name: Pack export drift guard
+        env:
+          SB_PACK_REPO_URL: ${{ secrets.SB_PACK_REPO_URL }}
+          SB_PACK_REPO_TOKEN: ${{ secrets.SB_PACK_REPO_TOKEN }}
+        run: |
+          if [ -n "$SB_PACK_REPO_TOKEN" ]; then
+            echo "read credential configured -> full drift check (re-export at the recorded commit)"
+            sidebutton-harbor-agent-check-packs --fetch
+          else
+            echo "no SB_PACK_REPO_TOKEN configured -> offline manifest-consistency validation"
+            sidebutton-harbor-agent-check-packs
+          fi

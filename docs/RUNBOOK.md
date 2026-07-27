@@ -162,7 +162,19 @@ and `skill_packs: []`:
 ```
 
 Record the `pack_repo_commit` **at export time** (§ pack flow): a mismatch between the packs shipped in
-this repo and the recorded commit invalidates the arm.
+this repo and the recorded commit invalidates the arm. The export tool does the recording for you —
+run it from a read-only checkout of the account pack repo and copy the sha it reports:
+
+```bash
+sidebutton-harbor-agent-export-packs --source ../pack-repo --commit <sha>   # writes packs/ + packs/EXPORT.json
+sidebutton-harbor-agent-check-packs                                          # verify before committing
+jq -r .source_commit src/sidebutton_harbor_agent/packs/EXPORT.json           # -> pack_repo_commit
+```
+
+A primed arm's `pack_repo_commit` **must** equal `EXPORT.json`'s `source_commit`; CI fails the build
+when `packs/` no longer matches that commit. See the README's *Pack export & drift guard* section for
+the credential-gated full check. For a **cold** arm after packs are bundled, pass an explicit empty
+directory: `--agent-kwarg packs_dir=/tmp/no-packs`.
 
 ---
 
@@ -271,7 +283,9 @@ before spending on a submission run. If it does not, do **not** submit:
 
 - read the failure taxonomy at **domain granularity only** (which domains failed — never which tasks,
   never how the oracle solves them);
-- improve the corresponding `sb-tb-*` packs against those domains, re-export, bump `pack_repo_commit`;
+- improve the corresponding `sb-tb-*` packs **in the account pack repo** (never here — the export is
+  one-way), then re-export with `sidebutton-harbor-agent-export-packs` and bump `pack_repo_commit` to
+  the new `source_commit`;
 - re-run cold → primed and re-gate.
 
 | Gate | Target | Meaning |

@@ -28,7 +28,9 @@ On top of the base agent it:
 | `src/sidebutton_harbor_agent/agent.py` | `SidebuttonAgent(ClaudeCode)` — the adapter. |
 | `src/sidebutton_harbor_agent/dryrun.py` | `sidebutton-harbor-agent-dryrun` — prints & validates the in-container command line, no container. |
 | `src/sidebutton_harbor_agent/trajectory_check.py` | `sidebutton-harbor-agent-check-trajectory` — host-side check that the verify loop visibly ran in a trial's ATIF trajectory (see [Smoke run](#smoke-run-ac3--needs-docker-not-runnable-in-a-container-less-agent-vm)). |
-| `src/sidebutton_harbor_agent/packs/` | Bundled skill packs (`sb-tb-*`). Empty for the cold arm; populated at a pinned commit by the pack-export tickets. |
+| `src/sidebutton_harbor_agent/pack_export.py` | `sidebutton-harbor-agent-export-packs` — one-way export of the `sb-tb-*` packs from the account pack repo at a pinned commit (see [Pack export & drift guard](#pack-export--drift-guard)). |
+| `src/sidebutton_harbor_agent/pack_check.py` | `sidebutton-harbor-agent-check-packs` — drift guard: `packs/` must still be a clean export of the commit recorded in `packs/EXPORT.json`. |
+| `src/sidebutton_harbor_agent/packs/` | Bundled skill packs (`sb-tb-*`) + `EXPORT.json` provenance. Empty for the cold arm; populated at a pinned commit by the export tool. |
 | `src/sidebutton_harbor_agent/config/CLAUDE.md` | The verify-before-done loop appended to every task instruction: enumerate the stated acceptance criteria and check each against real behavior, reproduce-before-fix for bug-shaped tasks, and "hidden tests exist — your own verification is the only signal". Domain-general and transparent for trajectory review. |
 | `docs/` | Campaign operator docs — per-arm parameter schema + operator runbook (see [Running a benchmark arm](#running-a-benchmark-arm)). |
 
@@ -87,7 +89,7 @@ sidebutton-harbor-agent-dryrun --model anthropic/claude-opus-4-8 --effort high
 
 ```text
 agent:   sidebutton
-version: 0.1.0+cli.1.5.1
+version: 0.2.0+cli.1.5.1
 model:   anthropic/claude-opus-4-8
 packs:   (none — cold arm)
 
@@ -192,6 +194,73 @@ as a signal and the excerpt as the evidence. The tool is host-side submission QA
 trajectory harbor already wrote, never enters a container, and cannot affect a reward. `--json` emits
 the same reports machine-readably.
 
+## Pack export & drift guard
+
+The `sb-tb-*` skill packs are **authored** in the benchmark account's private pack repo and
+**published** here as a frozen export pinned to one commit of it. A leaderboard maintainer re-runs a
+submission from public sources only, so nothing may point a task container at that private registry —
+the packs have to ship inside this repo. The flow is strictly one-way: this repo never writes back.
+
+```bash
+# 1. Export (operator, from a read-only checkout of the account pack repo)
+sidebutton-harbor-agent-export-packs --source ../pack-repo --commit <sha>
+
+# 2. Verify, then commit packs/ + packs/EXPORT.json
+sidebutton-harbor-agent-check-packs
+```
+
+The export reads the **committed** tree (`git archive` at the pinned commit), so a dirty checkout
+cannot leak uncommitted content into a public repo, and it selects exactly the top-level `sb-tb-*`
+directories — the generator scripts, `index.json` and any seeded example pack stay behind. Writes are
+mirror-shaped: pack subdirectories are replaced wholesale (a pack dropped upstream disappears here
+too) while loose files like this repo's `packs/README.md` are preserved. Exported packs are
+**bit-identical to the authored source**, metadata included, which is why re-exporting the same
+commit is byte-for-byte reproducible.
+
+`packs/EXPORT.json` records the provenance an arm's parameter block needs — `source_commit` is the
+§10.1 `pack_repo_commit` — plus a sha256 per exported file:
+
+```json
+{
+  "schema": 1,
+  "source_repo": "https://git.sidebutton.com/<account>.git",
+  "source_commit": "<full 40-hex sha>",
+  "source_commit_date": "2026-07-27T12:00:00+00:00",
+  "export_date": "2026-07-27T16:40:00Z",
+  "packs": ["sb-tb-algo", "sb-tb-build", "..."],
+  "files": { "sb-tb-algo/_skill.md": "<sha256>", "...": "..." }
+}
+```
+
+`EXPORT.json` is a loose file, so the adapter's loader ignores it (only subdirectories are packs).
+Set `SOURCE_DATE_EPOCH` to pin `export_date` when reproducing an export byte-for-byte.
+
+### Drift guard modes
+
+`sidebutton-harbor-agent-check-packs` runs in CI (the `packs` job in [`ci/ci.yml`](ci/ci.yml)) and
+degrades cleanly, because the private-repo fetch is credential-gated. It always prints which mode ran.
+
+| Mode | Needs | Catches |
+|---|---|---|
+| **offline** (default) | nothing | hand-edited, added or deleted files under `packs/`; pack list ≠ manifest; missing or malformed manifest; a short (ambiguous) `source_commit` |
+| **full** (`--source <checkout>` or `--fetch`) | a checkout, or `SB_PACK_REPO_TOKEN` (+ `SB_PACK_REPO_URL`) | everything above **plus** a *coordinated* edit where the file and its recorded hash were changed together, and packs re-synced from a newer commit without moving the pin |
+
+Offline mode cannot see a coordinated file+hash tamper — its hashes are self-referential by
+construction. That is what the credentialed mode is for; configure the secret where the full check
+matters. The cold state (no packs, no manifest) is valid and passes.
+
+`--fetch` clones the pack repo read-only into a temp dir using `SB_PACK_REPO_TOKEN`, passed via
+`GIT_ASKPASS` so it never reaches the command line or the clone's config, and redacted from output.
+Credentials are also stripped from any URL recorded in the manifest. The tool shells out to `git`
+(present on GitHub runners).
+
+**Cold arm, once packs are bundled.** `has_packs()` is a property of the packs directory, so after an
+export the default is *primed*. A cold arm then passes an explicit empty directory:
+
+```bash
+harbor run --agent sidebutton_harbor_agent:SidebuttonAgent --agent-kwarg packs_dir=/tmp/no-packs …
+```
+
 ## Fairness & reproducibility
 
 - **Public everything.** SideButton CLI is public npm; packs ship in this repo (never a private
@@ -204,7 +273,8 @@ the same reports machine-readably.
 - **Robustness.** A pack-layer failure degrades to the base agent rather than erroring the trial —
   a flaky layer must never cost a reward.
 - **Pinned & recorded.** `version()` reports `<adapter>+cli.<sidebutton-cli-version>`; the packs'
-  export commit is recorded per benchmark arm, so any run is re-creatable.
+  export commit is recorded in `packs/EXPORT.json` **and** per benchmark arm, and CI fails on drift
+  between the two, so any run is re-creatable.
 
 ## Development
 
@@ -214,7 +284,8 @@ ruff check .
 pytest -q
 ```
 
-CI (ruff + pytest on Python 3.12 & 3.13 + the dry-run smoke) is defined in
+CI (ruff + pytest on Python 3.12 & 3.13 + the dry-run smoke + the
+[pack drift guard](#drift-guard-modes)) is defined in
 [`ci/ci.yml`](ci/ci.yml). Move it to `.github/workflows/ci.yml` to activate it —
 it is parked outside `.github/workflows/` only because the automation account
 that opened the adapter PR lacks the GitHub `workflow` token scope.
