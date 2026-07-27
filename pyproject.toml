@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "sidebutton-harbor-agent"
-version = "0.1.0"
+version = "0.2.0"
 description = "SideButton agent adapter for the Harbor harness (Terminal-Bench 2.1)."
 readme = "README.md"
 requires-python = ">=3.12"
@@ -28,6 +28,8 @@ Homepage = "https://github.com/sidebutton/sidebutton-harbor-agent"
 [project.scripts]
 sidebutton-harbor-agent-dryrun = "sidebutton_harbor_agent.dryrun:main"
 sidebutton-harbor-agent-check-trajectory = "sidebutton_harbor_agent.trajectory_check:main"
+sidebutton-harbor-agent-export-packs = "sidebutton_harbor_agent.pack_export:main"
+sidebutton-harbor-agent-check-packs = "sidebutton_harbor_agent.pack_check:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/sidebutton_harbor_agent"]

@@ -25,7 +25,7 @@ def test_dryrun_json_output_is_valid_and_clean(capsys) -> None:
     assert rc == 0
     payload = json.loads(capsys.readouterr().out)
     assert payload["agent"] == "sidebutton"
-    assert payload["version"].startswith("0.1.0+cli.")
+    assert payload["version"].startswith("0.2.0+cli.")
     assert payload["env"]["ANTHROPIC_MODEL"] == "claude-opus-4-8"
     assert "--effort max" in payload["cli_flags"]
     assert payload["command"].startswith("claude ")

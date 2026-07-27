@@ -36,7 +36,7 @@ from harbor.utils.env import parse_bool_env_value
 
 #: Adapter package version. Distinct from the underlying Claude Code CLI version
 #: and from the pinned SideButton CLI version -- all three feed ``version()``.
-ADAPTER_VERSION = "0.1.0"
+ADAPTER_VERSION = "0.2.0"
 
 #: Default pinned SideButton CLI (public npm). Overridable per run via the
 #: ``sidebutton_cli_version`` kwarg or ``SIDEBUTTON_CLI_VERSION`` env var so a

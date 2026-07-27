@@ -25,7 +25,7 @@ def test_import_path_resolves_to_class() -> None:
 def test_identity(tmp_path: Path) -> None:
     assert SidebuttonAgent.name() == "sidebutton"
     agent = SidebuttonAgent(logs_dir=tmp_path, model_name="anthropic/claude-opus-4-8")
-    assert agent.version() == "0.1.0+cli.1.5.1"
+    assert agent.version() == "0.2.0+cli.1.5.1"
 
 
 def test_is_a_harbor_installed_agent() -> None:
