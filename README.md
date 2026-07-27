@@ -27,6 +27,7 @@ On top of the base agent it:
 |---|---|
 | `src/sidebutton_harbor_agent/agent.py` | `SidebuttonAgent(ClaudeCode)` — the adapter. |
 | `src/sidebutton_harbor_agent/dryrun.py` | `sidebutton-harbor-agent-dryrun` — prints & validates the in-container command line, no container. |
+| `src/sidebutton_harbor_agent/trajectory_check.py` | `sidebutton-harbor-agent-check-trajectory` — host-side check that the verify loop visibly ran in a trial's ATIF trajectory (see [Smoke run](#smoke-run-ac3--needs-docker-not-runnable-in-a-container-less-agent-vm)). |
 | `src/sidebutton_harbor_agent/packs/` | Bundled skill packs (`sb-tb-*`). Empty for the cold arm; populated at a pinned commit by the pack-export tickets. |
 | `src/sidebutton_harbor_agent/config/CLAUDE.md` | The verify-before-done loop appended to every task instruction: enumerate the stated acceptance criteria and check each against real behavior, reproduce-before-fix for bug-shaped tasks, and "hidden tests exist — your own verification is the only signal". Domain-general and transparent for trajectory review. |
 | `docs/` | Campaign operator docs — per-arm parameter schema + operator runbook (see [Running a benchmark arm](#running-a-benchmark-arm)). |
@@ -107,29 +108,89 @@ dry-run OK — invocation is valid (no overrides, model & effort wired).
 `--json` emits the same as machine-readable JSON (status line on stderr, so stdout stays pure).
 A non-zero exit means the invocation failed validation (e.g. an override token was present).
 
-## Operator smoke run (AC3 — manual, not agent-run)
+## Smoke run (AC3 — needs Docker; not runnable in a container-less agent VM)
 
-Run one Terminal-Bench task end-to-end on local Docker to confirm the adapter completes a trial
-and produces an ATIF trajectory. **Prerequisites:** Docker running, `harbor` installed, and
-`ANTHROPIC_API_KEY` exported.
+Run 2–3 Terminal-Bench tasks end-to-end on local Docker to confirm the adapter completes a trial,
+produces an ATIF trajectory, **and that the verify-before-done loop visibly executed in it**.
+**Prerequisites:** Docker running, `harbor` installed, and `ANTHROPIC_API_KEY` exported (a literal
+key — an OAuth-only credential does not reach the in-container CLI).
 
 ```bash
 export ANTHROPIC_API_KEY=sk-…
 
 harbor run \
   --agent sidebutton_harbor_agent:SidebuttonAgent \
-  --dataset terminal-bench-2-1 \
-  --include-task-name hello-world \
+  --dataset terminal-bench/terminal-bench-2-1 \
+  --include-task-name openssl-selfsigned-cert \
+  --include-task-name regex-log \
+  --include-task-name modernize-scientific-stack \
   --model anthropic/claude-opus-4-8 \
   --agent-kwarg reasoning_effort=high \
-  -k 1
+  -k 1 --n-concurrent 1
 ```
 
-`--agent-import-path` is the deprecated spelling of `--agent`; both resolve the same import path.
+Notes on the invocation:
 
-**Expect:** the run reaches a verifier reward for the task, and an ATIF `trajectory_path` is written
-under the run's trial directory (inherited from the Claude Code base — that trajectory is what the
-leaderboard submission uploads). Pick any quick task with `--include-task-name`.
+- **`--dataset` needs the `org/name` id.** A slash-less name is read as a *legacy registry* dataset
+  and fails with `Dataset 'terminal-bench-2-1' (version: 'None') not found`.
+- **The task ids are dataset-verified** (`SMOKE_TASK_NAMES` in
+  [`trajectory_check.py`](src/sidebutton_harbor_agent/trajectory_check.py), pinned by
+  `tests/test_docs.py`). They are criteria-dense — each instruction states requirements the
+  self-review turn can be seen enumerating — and `modernize-scientific-stack` is failure-shaped, so
+  it also exercises the reproduce-before-fix pillar. To substitute one, confirm it exists with
+  `harbor datasets download terminal-bench/terminal-bench-2-1` **and** update `SMOKE_TASK_NAMES` —
+  the README and that constant are pinned to each other, so changing only one fails the test.
+- One run over three repeated `--include-task-name` flags (the RUNBOOK's subset-iteration form) puts
+  all trials under one job directory, so the check below covers them in one pass. `--n-concurrent 1`
+  serializes the image pulls for a small VM; raise it if disk and CPU allow.
+- Leave `verify_loop` at its default (**on**): `verify_loop=false` is the cold/ablation arm and would
+  invalidate the smoke. Keep timeouts and resources at stock (fairness), and `--upload` off.
+- `--agent-import-path` is the deprecated spelling of `--agent`; both resolve the same import path.
+
+**Expect:** each run reaches a verifier reward, and an ATIF trajectory is written to
+`<trial>/agent/trajectory.json` (inherited from the Claude Code base — that trajectory is what a
+leaderboard submission uploads).
+
+Then check that the loop actually ran, per trial or across the whole job directory:
+
+```bash
+sidebutton-harbor-agent-check-trajectory jobs/<job-name>
+```
+
+```text
+PASS jobs/<job-name>/openssl-selfsigned-cert.1/agent/trajectory.json
+  steps: 11 (last step_id 11)
+  last edit at step: 9
+  ran + observed after last edit: [10]
+  restated task criteria after last edit: [10, 11]
+  restated task criteria anywhere: [5, 6, 7, 8, 9, 10, 11]
+  self-review excerpt:
+    | Re-checking the criterion I just fixed.
+    |
+    | All six acceptance criteria are now checked against observed output. Done.
+FAIL jobs/<job-name>/regex-log.1/agent/trajectory.json
+  steps: 4 (last step_id 4)
+  last edit at step: 3
+  ran + observed after last edit: (none)
+  restated task criteria after last edit: (none)
+  restated task criteria anywhere: (none)
+
+1/2 trajectory(ies) show a self-review turn.
+```
+
+It reports the self-review turn — the agent restating the task's criteria **and** running checks
+whose output it observed, *after* its last edit — and prints the matching excerpt to attach as AC3
+evidence. `FAIL` above is the failure mode this deliverable exists to prevent: the last action was an
+edit and the agent declared success without running anything. Exit code is non-zero when any
+trajectory looks like that. Because the loop is iterative ("if a check fails, fix it and verify
+again"), the *last* edit is often a fix the self-review itself found — hence the two criteria lines:
+the verdict uses the post-edit window, while `anywhere` points at the opening enumeration so you can
+lift the fullest excerpt.
+
+The two signals are keyword and tool-call heuristics over free-form agent prose, so treat the verdict
+as a signal and the excerpt as the evidence. The tool is host-side submission QA: it reads a
+trajectory harbor already wrote, never enters a container, and cannot affect a reward. `--json` emits
+the same reports machine-readably.
 
 ## Fairness & reproducibility
 

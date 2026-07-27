@@ -17,13 +17,17 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-dev = ["pytest>=8.0", "ruff>=0.6"]
+# ruff is pinned to a minor like harbor is: an unbounded `ruff>=0.6` let 0.16 add
+# a rule to the default set, which turned the CI gate red on a fresh install
+# without a code change.
+dev = ["pytest>=8.0", "ruff>=0.16,<0.17"]
 
 [project.urls]
 Homepage = "https://github.com/sidebutton/sidebutton-harbor-agent"
 
 [project.scripts]
 sidebutton-harbor-agent-dryrun = "sidebutton_harbor_agent.dryrun:main"
+sidebutton-harbor-agent-check-trajectory = "sidebutton_harbor_agent.trajectory_check:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/sidebutton_harbor_agent"]
