@@ -167,14 +167,20 @@ run it from a read-only checkout of the account pack repo and copy the sha it re
 
 ```bash
 sidebutton-harbor-agent-export-packs --source ../pack-repo --commit <sha>   # writes packs/ + packs/EXPORT.json
-sidebutton-harbor-agent-check-packs                                          # verify before committing
+sidebutton-harbor-agent-check-packs --source ../pack-repo                    # verify before committing
 jq -r .source_commit src/sidebutton_harbor_agent/packs/EXPORT.json           # -> pack_repo_commit
 ```
 
-A primed arm's `pack_repo_commit` **must** equal `EXPORT.json`'s `source_commit`; CI fails the build
-when `packs/` no longer matches that commit. See the README's *Pack export & drift guard* section for
-the credential-gated full check. For a **cold** arm after packs are bundled, pass an explicit empty
-directory: `--agent-kwarg packs_dir=/tmp/no-packs`.
+Keep the `--source` on the verify step: bare `check-packs` compares the export against the manifest
+the same run just wrote, so it cannot fail on a bad export — only `--source` re-exports the recorded
+commit and byte-compares.
+
+A primed arm's `pack_repo_commit` **must** equal `EXPORT.json`'s `source_commit`. CI fails the build
+when `packs/` no longer matches the commit `EXPORT.json` records, but it cannot see the arm's
+parameter block — copying the sha across (the `jq` line above) is the operator's job and nothing
+checks it. See the README's *Pack export & drift guard* section for the credential-gated full check.
+For a **cold** arm after packs are bundled, pass an explicit empty directory:
+`--agent-kwarg packs_dir=/tmp/no-packs`.
 
 ---
 

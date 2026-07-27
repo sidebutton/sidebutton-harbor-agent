@@ -77,7 +77,14 @@ def test_install_installs_sidebutton_cli(tmp_path: Path, fake_env) -> None:
 
 
 def test_install_cold_arm_uploads_nothing(tmp_path: Path, fake_env) -> None:
-    agent = SidebuttonAgent(logs_dir=tmp_path, model_name="anthropic/claude-opus-4-8")
+    """Driven from an explicit empty dir, like ``test_cold_arm_is_a_clean_noop``:
+    the cold arm is a property of *a* packs dir with no packs, not of the bundled
+    one happening to be empty today."""
+    empty = tmp_path / "empty-packs"
+    empty.mkdir()
+    agent = SidebuttonAgent(
+        logs_dir=tmp_path, model_name="anthropic/claude-opus-4-8", packs_dir=str(empty)
+    )
     asyncio.run(agent.install(fake_env))
     assert fake_env.uploads == []
 

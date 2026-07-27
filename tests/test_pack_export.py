@@ -102,10 +102,31 @@ def test_manifest_is_a_loose_file_the_adapter_ignores(tmp_path: Path, pack_sourc
         ("https://user@git.sidebutton.com/12.git", "https://git.sidebutton.com/12.git"),
         ("https://git.sidebutton.com/12.git", "https://git.sidebutton.com/12.git"),
         ("git@github.com:sidebutton/x.git", "git@github.com:sidebutton/x.git"),
+        # git ends the authority at the first '/', so everything before the last
+        # '@' is userinfo. urlsplit also stops at '?' and '#', which used to hand
+        # exactly these secrets through into the public manifest.
+        ("https://x-access-token:ghp_SE?CRET@git.sidebutton.com/12.git",
+         "https://git.sidebutton.com/12.git"),
+        ("https://x-access-token:ghp_SE#CRET@git.sidebutton.com/12.git",
+         "https://git.sidebutton.com/12.git"),
+        ("https://u:p@w@git.sidebutton.com/12.git", "https://git.sidebutton.com/12.git"),
+        ("ssh://user:secret@git.sidebutton.com/12.git", "ssh://git.sidebutton.com/12.git"),
     ],
 )
 def test_scrub_url_strips_credentials(url: str, expected: str) -> None:
     assert scrub_url(url) == expected
+
+
+def test_a_credential_with_url_metacharacters_is_never_recorded(tmp_path: Path) -> None:
+    """The one place a secret could reach a *public* repo is source_repo."""
+    source = make_pack_source(
+        tmp_path / "repo", origin="https://x-access-token:ghp_SE?CRET@git.sidebutton.com/12.git"
+    )
+    dest = tmp_path / "packs"
+    export_packs(source=source.path, dest=dest)
+
+    assert "ghp_SE?CRET" not in (dest / MANIFEST_NAME).read_text(encoding="utf-8")
+    assert _manifest(dest)["source_repo"] == "https://git.sidebutton.com/12.git"
 
 
 def test_a_token_bearing_origin_is_never_recorded(tmp_path: Path) -> None:
@@ -168,6 +189,26 @@ def test_reexport_over_itself_is_stable(tmp_path: Path, pack_source, monkeypatch
     export_packs(source=pack_source.path, dest=dest)
 
     assert _tree(dest) == before
+
+
+def test_export_ignores_the_operators_git_config(tmp_path: Path, pack_source, monkeypatch) -> None:
+    """AC1 across environments, not just within one.
+
+    ``git archive`` applies the same end-of-line conversion a checkout would, so
+    an operator with ``core.autocrlf=true`` used to export CRLF and record 48
+    different sha256s for the same commit — the credentialed CI re-export then
+    reported drift nobody could reproduce locally.
+    """
+    gitconfig = tmp_path / "crlf.gitconfig"
+    gitconfig.write_text("[core]\n\tautocrlf = true\n\teol = crlf\n", encoding="utf-8")
+
+    plain = export_packs(source=pack_source.path, dest=tmp_path / "plain")
+    monkeypatch.setenv("GIT_CONFIG_GLOBAL", str(gitconfig))
+    converted = export_packs(source=pack_source.path, dest=tmp_path / "converted")
+
+    assert _tree(tmp_path / "plain") == _tree(tmp_path / "converted")
+    assert plain.manifest["files"] == converted.manifest["files"]
+    assert b"\r\n" not in (tmp_path / "converted" / "sb-tb-ml" / "_skill.md").read_bytes()
 
 
 def test_only_export_date_moves_without_source_date_epoch(
@@ -261,12 +302,71 @@ def test_mirror_removes_non_matching_pack_dirs_too(tmp_path: Path, pack_source) 
     """The adapter stages *every* subdir, so a non-``sb-tb-*`` one is drift too."""
     dest = tmp_path / "packs"
     dest.mkdir()
+    (dest / "README.md").write_text("adapter-owned\n", encoding="utf-8")
     (dest / "hand-added").mkdir()
     (dest / "hand-added" / "SKILL.md").write_text("not from the source repo\n", encoding="utf-8")
 
     export_packs(source=pack_source.path, dest=dest)
 
     assert not (dest / "hand-added").exists()
+
+
+def test_refuses_to_mirror_into_a_dir_that_is_not_a_packs_dir(
+    tmp_path: Path, pack_source
+) -> None:
+    """The mirror deletes every pack subdir of --dest, so a typo one level too
+    high would take out ``config/`` and every other subpackage."""
+    victim = tmp_path / "sidebutton_harbor_agent"
+    (victim / "config").mkdir(parents=True)
+    (victim / "config" / "CLAUDE.md").write_text("the verify loop\n", encoding="utf-8")
+
+    with pytest.raises(PackExportError, match="does not look like a packs directory"):
+        export_packs(source=pack_source.path, dest=victim)
+
+    assert (victim / "config" / "CLAUDE.md").is_file(), "nothing may be deleted before the check"
+
+
+def test_mirrors_into_an_empty_or_sentinel_bearing_dir(tmp_path: Path, pack_source) -> None:
+    """The two shapes a real packs/ ever has: brand new, or already an export."""
+    export_packs(source=pack_source.path, dest=tmp_path / "fresh")  # does not exist yet
+
+    empty = tmp_path / "empty"
+    empty.mkdir()
+    export_packs(source=pack_source.path, dest=empty)
+
+    # ...and re-exporting over a previous export (EXPORT.json is a sentinel).
+    export_packs(source=pack_source.path, dest=empty)
+
+
+def test_dest_that_is_a_file_fails_cleanly(tmp_path: Path, pack_source) -> None:
+    """``mkdir(exist_ok=True)`` only tolerates an existing *directory*; without
+    this guard the CLI, which catches PackExportError only, printed a traceback."""
+    occupied = tmp_path / "packs"
+    occupied.write_text("not a directory\n", encoding="utf-8")
+
+    with pytest.raises(PackExportError, match="not a directory"):
+        export_packs(source=pack_source.path, dest=occupied)
+
+
+def test_a_failed_export_leaves_the_previous_one_intact(tmp_path: Path, pack_source) -> None:
+    """The mirror delete must not run until the new content is read and verified.
+
+    A half-export — pack dirs gone, stale manifest left behind — is worse than no
+    export: the repo's own drift guard then reports the repo as broken.
+    """
+    dest = tmp_path / "packs"
+    export_packs(source=pack_source.path, dest=dest)
+    good = _tree(dest)
+
+    # Upstream adds a symlink, which the export refuses (after the point where
+    # the old code had already deleted every pack dir).
+    (pack_source.path / "sb-tb-ml" / "linked.md").symlink_to("../../FAIRNESS.md")
+    commit_all(pack_source.path, "feat(packs): add a link")
+
+    with pytest.raises(PackExportError, match="refusing to export symlinks"):
+        export_packs(source=pack_source.path, dest=dest)
+
+    assert _tree(dest) == good
 
 
 def test_symlinks_in_the_source_are_refused(tmp_path: Path, pack_source) -> None:
@@ -301,6 +401,7 @@ def test_a_symlinked_dir_in_dest_is_replaced_not_a_crash(tmp_path: Path, pack_so
     bare OSError halfway through — after deleting the packs sorted before it."""
     dest = tmp_path / "packs"
     dest.mkdir()
+    (dest / "README.md").write_text("adapter-owned\n", encoding="utf-8")
     (dest / "zz-linked").symlink_to(pack_source.path)
 
     export_packs(source=pack_source.path, dest=dest)
@@ -317,6 +418,7 @@ def test_hidden_dirs_do_not_survive_the_mirror_write(tmp_path: Path, pack_source
 
     dest = tmp_path / "packs"
     dest.mkdir()
+    (dest / "README.md").write_text("adapter-owned\n", encoding="utf-8")
     (dest / ".hidden-pack").mkdir()
     (dest / ".hidden-pack" / "SKILL.md").write_text("invisible to the loader\n", encoding="utf-8")
 

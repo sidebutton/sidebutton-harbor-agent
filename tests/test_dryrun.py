@@ -20,8 +20,16 @@ def test_dryrun_human_output_and_exit_zero(capsys) -> None:
     assert "dry-run OK" in out
 
 
-def test_dryrun_json_output_is_valid_and_clean(capsys) -> None:
-    rc = main(["--model", "anthropic/claude-opus-4-8", "--effort", "max", "--json"])
+def test_dryrun_json_output_is_valid_and_clean(tmp_path, capsys) -> None:
+    # Cold arm driven from an explicit empty packs dir rather than the bundled
+    # one: this assertion is about what a *cold* invocation looks like, and it
+    # has to keep holding the day a real export lands in packs/.
+    empty = tmp_path / "no-packs"
+    empty.mkdir()
+    rc = main(
+        ["--model", "anthropic/claude-opus-4-8", "--effort", "max", "--json",
+         "--packs-dir", str(empty)]
+    )
     assert rc == 0
     payload = json.loads(capsys.readouterr().out)
     assert payload["agent"] == "sidebutton"
@@ -29,7 +37,7 @@ def test_dryrun_json_output_is_valid_and_clean(capsys) -> None:
     assert payload["env"]["ANTHROPIC_MODEL"] == "claude-opus-4-8"
     assert "--effort max" in payload["cli_flags"]
     assert payload["command"].startswith("claude ")
-    assert payload["packs"] == []  # cold arm by default
+    assert payload["packs"] == []  # cold arm
 
     # Fairness: no verifier/timeout/resource override anywhere in the invocation.
     blob = f"{payload['command']} {payload['cli_flags']} {' '.join(payload['setup_commands'])}"

@@ -149,6 +149,13 @@ def _clean_env(monkeypatch: pytest.MonkeyPatch) -> None:
         "MAX_THINKING_TOKENS",
         "CLAUDE_CODE_EFFORT_LEVEL",
         "CLAUDE_CODE_MAX_TURNS",
+        # Pack export/drift guard: a host that happens to configure a pack repo
+        # or a reproducibility epoch must not steer the suite.
+        "SB_PACK_REPO_URL",
+        "SB_PACK_REPO_TOKEN",
+        "SB_PACK_REPO_USER",
+        "SOURCE_DATE_EPOCH",
+        "GIT_CONFIG_GLOBAL",
     ):
         monkeypatch.delenv(var, raising=False)
 
