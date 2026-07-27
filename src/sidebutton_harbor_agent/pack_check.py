@@ -23,6 +23,12 @@ failing when no credential is configured:
 
 The mode that ran is always printed, so a green CI log never overstates what was
 verified.
+
+``--fetch`` requires the operator to name the remote in ``SB_PACK_REPO_URL``
+whenever a token is configured. The manifest's own ``source_repo`` is read out of
+a committed file, so using it as the clone target would let a pull request
+redirect the read credential — and then certify ``packs/`` against a repo of the
+author's choosing.
 """
 
 from __future__ import annotations
@@ -31,12 +37,12 @@ import argparse
 import json
 import os
 import re
+import stat
 import sys
 import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
-from urllib.parse import urlsplit, urlunsplit
 
 from sidebutton_harbor_agent.pack_export import (
     MANIFEST_NAME,
@@ -50,10 +56,12 @@ from sidebutton_harbor_agent.pack_export import (
     pack_dirs,
     read_manifest,
     scrub_url,
+    split_userinfo,
 )
 
-#: Remote URL for the credentialed mode. Falls back to the manifest's own
-#: ``source_repo`` when unset.
+#: Remote URL for the credentialed mode. **Required whenever a token is set** —
+#: see the module docstring. Falls back to the manifest's own ``source_repo``
+#: only when there is no credential that a redirect could capture.
 ENV_REPO_URL = "SB_PACK_REPO_URL"
 
 #: Read credential for the private pack repo. Supplied by the operator (CI
@@ -76,17 +84,36 @@ _FULL_SHA_RE = re.compile(r"^[0-9a-f]{40}$")
 #: same reason: the loader skips them, the upload does not.
 ALLOWED_LOOSE_FILES = frozenset({"README.md", MANIFEST_NAME})
 
-#: Manifest keys compared field-wise in full mode. ``export_date`` is excluded on
-#: purpose — it is wall-clock provenance, not content, so re-exporting the same
+#: Every key a schema-1 manifest may carry. Closed rather than open: ``packs/``
+#: is uploaded wholesale into the task container, so an unknown key is a free
+#: text channel into it that no other check would look at.
+_MANIFEST_KEYS = frozenset(
+    {
+        "schema",
+        "source_repo",
+        "source_commit",
+        "source_commit_date",
+        "export_date",
+        "pack_glob",
+        "packs",
+        "files",
+    }
+)
+
+#: Manifest keys compared field-wise in full mode — only the ones a re-export
+#: *derives*, so a mismatch means something. ``schema``, ``source_repo``,
+#: ``source_commit`` and ``pack_glob`` are excluded because they are fed into
+#: that re-export as inputs: comparing them would compare each against itself
+#: and read as verification that never happens. ``export_date`` is excluded
+#: because it is wall-clock provenance, not content — re-exporting the same
 #: commit tomorrow is not drift.
-_COMPARED_MANIFEST_KEYS = (
-    "schema",
-    "source_repo",
-    "source_commit",
-    "source_commit_date",
-    "pack_glob",
-    "packs",
-    "files",
+_COMPARED_MANIFEST_KEYS = ("source_commit_date", "packs", "files")
+
+#: Permission bits that have no business on a pack file. setuid/setgid/sticky
+#: and group/other-write survive into the task container through
+#: ``_stage_packs``, and no hash or byte-compare can see a mode.
+_FORBIDDEN_MODE_BITS = (
+    stat.S_ISUID | stat.S_ISGID | stat.S_ISVTX | stat.S_IWGRP | stat.S_IWOTH
 )
 
 
@@ -145,6 +172,10 @@ def _validate_manifest_shape(manifest: Any) -> list[str]:
         # a newer exporter may mean something different by the same key.
         return [f"unsupported {MANIFEST_NAME} schema {schema!r} (expected {MANIFEST_SCHEMA})"]
 
+    unknown = sorted(set(manifest) - _MANIFEST_KEYS)
+    if unknown:
+        problems.append(f"{MANIFEST_NAME}: unknown key(s) {', '.join(unknown)}")
+
     for key in ("source_repo", "source_commit", "source_commit_date", "export_date", "pack_glob"):
         if not isinstance(manifest.get(key), str) or not manifest[key]:
             problems.append(f"{MANIFEST_NAME}: missing or empty {key!r}")
@@ -184,10 +215,15 @@ def _validate_recorded_paths(files: dict[str, str], packs: list[str]) -> list[st
 def unexpected_entries(packs_dir: Path, packs: list[str]) -> list[str]:
     """Anything under ``packs/`` the export could not have produced.
 
-    Covers the two shapes the hash map alone cannot see, both of which are
-    uploaded into the task container by ``_stage_packs``: a link (never hashed,
-    never byte-compared — the export refuses them at the source, so one here was
-    added by hand) and top-level content that is not a pack.
+    ``_stage_packs`` uploads the whole directory into the task container, so the
+    guard has to cover everything the sha256 map structurally cannot: a link
+    (never hashed, never byte-compared — the export refuses links at the source,
+    so one here was added by hand), top-level content that is not a pack, an
+    empty directory (``git archive`` emits none), and a permission bit, which no
+    content comparison can see.
+
+    ``packs`` must be :func:`pack_dirs` output — real directories only. Passing a
+    symlinked entry would make the walk below follow it out of ``packs/``.
     """
     problems: list[str] = []
     for entry in sorted(packs_dir.iterdir()):
@@ -205,8 +241,15 @@ def unexpected_entries(packs_dir: Path, packs: list[str]) -> list[str]:
             rel = path.relative_to(packs_dir).as_posix()
             if path.is_symlink():
                 problems.append(f"unexpected link under packs/: {rel}")
-            elif not path.is_dir() and not path.is_file():
+            elif path.is_dir():
+                if not any(path.iterdir()):
+                    problems.append(f"empty directory under packs/: {rel}")
+            elif not path.is_file():
                 problems.append(f"not a regular file under packs/: {rel}")
+            else:
+                mode = path.stat().st_mode
+                if mode & _FORBIDDEN_MODE_BITS:
+                    problems.append(f"unsafe permissions ({stat.filemode(mode)}) under packs/: {rel}")
     return problems
 
 
@@ -222,7 +265,10 @@ def check_offline(packs_dir: Path) -> CheckReport:
     present = pack_dirs(packs_dir)
     report.packs = present
     # Runs before the cold-state shortcut: junk left in an empty packs/ still
-    # ships into the container.
+    # ships into the container. Reported *alongside* the content comparison
+    # below and never instead of it — a stray loose file must not mask a
+    # hand-edited pack file underneath, or a reviewer fixes one, re-runs, and
+    # only then learns about the other.
     report.problems.extend(unexpected_entries(packs_dir, present))
     try:
         manifest = read_manifest(packs_dir)
@@ -256,15 +302,19 @@ def check_offline(packs_dir: Path) -> CheckReport:
 
     report.source_commit = manifest["source_commit"]
     recorded_packs: list[str] = manifest["packs"]
+    files: dict[str, str] = manifest["files"]
+
+    # These two genuinely block the per-file comparison: recorded paths are
+    # resolved on disk below, and a disagreeing pack list makes "which files
+    # should exist" undefined. Everything else is reported cumulatively.
+    blocking = _validate_recorded_paths(files, recorded_packs)
     if recorded_packs != present:
-        report.problems.append(
+        blocking.append(
             f"pack list drift: {MANIFEST_NAME} records {recorded_packs} but "
             f"packs/ contains {present}"
         )
-
-    files: dict[str, str] = manifest["files"]
-    report.problems.extend(_validate_recorded_paths(files, recorded_packs))
-    if report.problems:
+    if blocking:
+        report.problems.extend(blocking)
         return report
 
     actual = hash_files(packs_dir, present)
@@ -280,13 +330,20 @@ def check_offline(packs_dir: Path) -> CheckReport:
 
 
 # ---------------------------------------------------------------- full validation
-def _tree_snapshot(root: Path, packs: list[str]) -> dict[str, bytes]:
-    """Every file under ``packs`` as ``relative posix path -> bytes``."""
-    snapshot: dict[str, bytes] = {}
+def _tree_snapshot(root: Path, packs: list[str]) -> dict[str, tuple[bytes, bool]]:
+    """Every file under ``packs`` as ``relative posix path -> (bytes, is_exec)``.
+
+    The executable bit rides along because ``git archive`` reproduces it from the
+    tree (100644 vs 100755) — so it is part of "a clean export of that commit",
+    and it is the one attribute of a bundled pack file that a content hash can
+    never see.
+    """
+    snapshot: dict[str, tuple[bytes, bool]] = {}
     for pack in packs:
         for path in sorted((root / pack).rglob("*")):
             if path.is_file() and not path.is_symlink():
-                snapshot[path.relative_to(root).as_posix()] = path.read_bytes()
+                is_exec = bool(path.stat().st_mode & stat.S_IXUSR)
+                snapshot[path.relative_to(root).as_posix()] = (path.read_bytes(), is_exec)
     return snapshot
 
 
@@ -317,8 +374,10 @@ def compare_with_source(packs_dir: Path, manifest: dict[str, Any], source: Path)
                 problems.append(f"missing from packs/: {rel}")
             elif rel not in expected:
                 problems.append(f"not present at the recorded commit: {rel}")
-            elif expected[rel] != actual[rel]:
+            elif expected[rel][0] != actual[rel][0]:
                 problems.append(f"content differs from the recorded commit: {rel}")
+            elif expected[rel][1] != actual[rel][1]:
+                problems.append(f"file mode differs from the recorded commit: {rel}")
 
         for key in _COMPARED_MANIFEST_KEYS:
             if manifest.get(key) != result.manifest.get(key):
@@ -352,22 +411,30 @@ def split_credentials(url: str, token: str, user: str) -> tuple[str, str]:
     would put the secret on the command line, where any process can read it out
     of ``ps``. Returns ``(url_without_password, effective_token)`` — the caller
     hands the token to git through ``GIT_ASKPASS`` instead.
+
+    Only the *password* half is relocated. A bare ``https://name@host`` userinfo
+    is left alone: it selects the account git authenticates as, and nothing here
+    can tell a login name from a token-as-username PAT — reading it as a secret
+    would break a checkout that authenticates through a credential helper. The
+    credential that matters, ``SB_PACK_REPO_TOKEN``, never reaches argv.
+
+    The authority is parsed the way git parses it rather than with ``urlsplit``
+    (see :func:`~sidebutton_harbor_agent.pack_export.split_userinfo`), so a
+    password containing ``?`` or ``#`` is still recognised as a password.
     """
     if not url.startswith(("http://", "https://")):
         return url, token
-    parts = urlsplit(url)
-    host = parts.netloc
+    scheme, userinfo, rest = split_userinfo(url)
     named_user = False
-    if "@" in host:
-        userinfo, host = host.rsplit("@", 1)
+    if userinfo:
         embedded_user, _, embedded_token = userinfo.partition(":")
         user = embedded_user or user
         token = embedded_token or token
         # A username the operator spelled out selects the account git
         # authenticates as; only the *password* half is a secret to relocate.
         named_user = bool(embedded_user)
-    netloc = f"{user}@{host}" if (token or named_user) else host
-    return urlunsplit((parts.scheme, netloc, parts.path, parts.query, parts.fragment)), token
+    netloc = f"{user}@{rest}" if (token or named_user) else rest
+    return f"{scheme}://{netloc}", token
 
 
 def fetch_source(url: str, workdir: Path) -> Path:
@@ -383,11 +450,16 @@ def fetch_source(url: str, workdir: Path) -> Path:
         os.environ.get(ENV_REPO_TOKEN, ""),
         os.environ.get(ENV_REPO_USER) or DEFAULT_REPO_USER,
     )
+    if token and clone_url.startswith("http://"):
+        raise PackExportError(
+            "refusing to send the pack-repo credential over cleartext http:// — "
+            f"use an https:// URL in {ENV_REPO_URL}"
+        )
 
     # Never let git fall back to an interactive prompt: in CI that is a hang,
     # not a failure.
     env: dict[str, str] = {"GIT_TERMINAL_PROMPT": "0"}
-    if token:
+    if token and clone_url.startswith("https://"):
         env.update(_askpass_env(workdir, token))
 
     # ``--`` so a URL that looks like an option is never read as one.
@@ -407,24 +479,46 @@ def check(
     if not report.ok or report.state != "exported" or not (source or fetch):
         if source or fetch:
             # Say why the stronger check did not run, so a log line can never
-            # imply more was verified than actually was.
+            # imply more was verified than actually was. A failure is always the
+            # reason when there is one — a cold packs/ dir carrying hand-added
+            # junk fails, and reporting that as "nothing exported yet" would be
+            # the exact overstatement this string exists to prevent.
             reason = (
-                "nothing exported yet"
-                if report.state == "cold (no packs exported)"
-                else "full check skipped: the offline stage already failed"
+                "full check skipped: the offline stage already failed"
+                if not report.ok
+                else "nothing exported yet"
             )
             report.mode = f"offline (manifest consistency) — {reason}"
         return report
 
     manifest = read_manifest(packs_dir)
-    assert manifest is not None  # state == "exported" already proved it parses
+    if manifest is None:  # unreachable: state == "exported" already parsed it
+        report.problems.append(f"{MANIFEST_NAME} disappeared while checking {packs_dir}")
+        return report
 
     if source:
         report.mode = f"full (re-export from {source})"
         report.problems.extend(compare_with_source(packs_dir, manifest, source))
         return report
 
-    url = os.environ.get(ENV_REPO_URL) or manifest["source_repo"]
+    env_token = os.environ.get(ENV_REPO_TOKEN, "")
+    url = os.environ.get(ENV_REPO_URL, "")
+    if not url:
+        if env_token:
+            # ``source_repo`` is repo-controlled data: it is read out of a
+            # committed file that any pull request can edit. Falling back to it
+            # while a read credential is configured would let a one-line change
+            # to packs/EXPORT.json point the CI secret at a host of the author's
+            # choosing -- and a "full (fetch ...)" PASS could then be produced
+            # against a repo the author also populated. The URL a credential is
+            # sent to must come from the operator.
+            report.problems.append(
+                f"refusing to send {ENV_REPO_TOKEN} to the URL recorded in "
+                f"{MANIFEST_NAME} (repo-controlled): set {ENV_REPO_URL} explicitly"
+            )
+            return report
+        # No credential to misdirect, so the manifest's own URL is fine.
+        url = manifest["source_repo"]
     if not url:
         report.problems.append(
             f"--fetch needs a source URL: set {ENV_REPO_URL} or record source_repo"
@@ -434,24 +528,30 @@ def check(
     # The effective token may come from the env *or* from the URL itself — both
     # have to be redacted from anything this prints.
     _, token = split_credentials(
-        url, os.environ.get(ENV_REPO_TOKEN, ""), os.environ.get(ENV_REPO_USER) or DEFAULT_REPO_USER
+        url, env_token, os.environ.get(ENV_REPO_USER) or DEFAULT_REPO_USER
     )
     report.mode = f"full (fetch {scrub_url(url)})"
+    # git's stderr echoes the remote it failed on, so redact the token *and* the
+    # raw userinfo it may have been embedded in.
+    secrets = (token, split_userinfo(url)[1])
     with tempfile.TemporaryDirectory(prefix="sb-pack-fetch-") as tmp:
         try:
             clone = fetch_source(url, Path(tmp))
         except PackExportError as exc:
-            report.problems.append(_redact(str(exc), token))
+            report.problems.append(_redact(str(exc), *secrets))
             return report
         report.problems.extend(
-            _redact(problem, token) for problem in compare_with_source(packs_dir, manifest, clone)
+            _redact(problem, *secrets) for problem in compare_with_source(packs_dir, manifest, clone)
         )
     return report
 
 
-def _redact(text: str, token: str) -> str:
+def _redact(text: str, *secrets: str) -> str:
     """Never let a credential reach a public CI log."""
-    return text.replace(token, "***") if token else text
+    for secret in secrets:
+        if secret:
+            text = text.replace(secret, "***")
+    return text
 
 
 # --------------------------------------------------------------------------- CLI

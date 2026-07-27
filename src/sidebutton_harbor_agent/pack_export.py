@@ -17,8 +17,13 @@ no code path from this repo back to the account repo. The source is read at a
 cannot leak uncommitted content into a public export.
 
 **Reproducible.** Same source commit -> byte-identical ``packs/``: content comes
-from the pinned tree, the manifest serializes deterministically (fixed key order,
-sorted lists), and ``export_date`` honours ``SOURCE_DATE_EPOCH``.
+from the pinned tree, every git call pins the end-of-line settings so the
+operator's own git configuration cannot change the exported bytes, the manifest
+serializes deterministically (fixed key order, sorted lists), and ``export_date``
+honours ``SOURCE_DATE_EPOCH``.
+
+**Atomic.** The new content is extracted and verified in a temp dir before
+``dest`` is touched, so a failure anywhere leaves the previous export intact.
 
 The written manifest (``packs/EXPORT.json``) records what an arm's parameter
 block needs — ``source_commit`` is the §10.1 ``pack_repo_commit`` — plus a
@@ -43,7 +48,6 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
-from urllib.parse import urlsplit, urlunsplit
 
 #: Manifest file written next to the exported packs. A loose file, so the
 #: adapter's loader ignores it (``SidebuttonAgent.pack_skill_dirs`` takes
@@ -68,6 +72,22 @@ PACK_GLOB = "sb-tb-*"
 READ_ONLY_GIT_SUBCOMMANDS = frozenset(
     {"archive", "clone", "config", "fetch", "ls-tree", "rev-parse", "show"}
 )
+
+#: Git config forced on every invocation, so an export is a function of the
+#: pinned commit alone and not of the operator's ``~/.gitconfig``. Without
+#: ``core.autocrlf``/``core.eol`` pinned, ``git archive`` applies the same
+#: end-of-line conversion a checkout would: an operator running with
+#: ``autocrlf=true`` exports CRLF and gets 48 different sha256s for the same
+#: commit, and the credentialed CI re-export then reports drift nobody can
+#: reproduce. That is AC1 ("same source commit -> byte-identical output"), so it
+#: is pinned here rather than left to the environment.
+DETERMINISTIC_GIT_CONFIG = ("core.autocrlf=false", "core.eol=lf", "core.quotepath=false")
+
+#: Loose files whose presence marks a directory as an export destination.
+#: ``export_packs`` deletes every pack subdirectory of its ``--dest``, so a
+#: mistyped path would otherwise destroy an unrelated tree; see
+#: :func:`_assert_mirrorable`.
+MIRROR_SENTINELS = frozenset({MANIFEST_NAME, "README.md"})
 
 
 class PackExportError(RuntimeError):
@@ -125,8 +145,9 @@ def _git(
         raise PackExportError("refusing to run 'git config' in a write form")
 
     # Fixed argv, never a shell string: nothing here is interpolated by a shell.
+    config = [flag for setting in DETERMINISTIC_GIT_CONFIG for flag in ("-c", setting)]
     completed = subprocess.run(
-        ["git", *args],
+        ["git", *config, *args],
         cwd=str(cwd) if cwd else None,
         capture_output=True,
         check=False,
@@ -172,21 +193,39 @@ def source_repo_url(source: Path) -> str:
     return scrub_url(url)
 
 
+def split_userinfo(url: str) -> tuple[str, str, str]:
+    """Split ``scheme://userinfo@host/path`` into ``(scheme, userinfo, rest)``.
+
+    Deliberately *not* :func:`urllib.parse.urlsplit`: git ends the authority at
+    the first ``/`` and treats everything before the last ``@`` as userinfo,
+    while ``urlsplit`` also stops at ``?`` and ``#``. For a credential
+    containing one of those (``https://u:p?w@host/12.git``) ``urlsplit`` puts no
+    ``@`` in ``netloc`` at all, and a scrubber built on it hands the secret
+    straight through into a public manifest. Parsing the authority the way git
+    does closes that.
+
+    ``userinfo`` is ``""`` when there is none; ``rest`` keeps the leading
+    ``/``. A URL with no ``scheme://`` (scp-style ``git@host:path``) yields
+    ``("", "", url)`` — its ``user`` is a host account name, not a credential.
+    """
+    scheme, sep, remainder = url.partition("://")
+    if not sep:
+        return "", "", url
+    authority, slash, path = remainder.partition("/")
+    userinfo, at, host = authority.rpartition("@")
+    return scheme, userinfo if at else "", host + slash + path
+
+
 def scrub_url(url: str) -> str:
     """Strip any ``user[:password]@`` userinfo from a URL.
 
     Guards the one place a credential could otherwise be committed to a public
     repo: the manifest's ``source_repo``.
     """
-    if "@" not in url:
+    scheme, userinfo, rest = split_userinfo(url)
+    if not userinfo:
         return url
-    parts = urlsplit(url)
-    if not parts.netloc or "@" not in parts.netloc:
-        # scp-style ``git@host:path`` has no scheme; keep it as-is (the
-        # user there is a host account name, not a credential).
-        return url
-    host = parts.netloc.rsplit("@", 1)[1]
-    return urlunsplit((parts.scheme, host, parts.path, parts.query, parts.fragment))
+    return f"{scheme}://{rest}"
 
 
 def discover_packs(source: Path, sha: str, glob: str = PACK_GLOB) -> list[str]:
@@ -322,6 +361,10 @@ def read_manifest(dest: Path) -> dict[str, Any] | None:
         raise PackExportError(f"{path} is not valid UTF-8: {exc}") from exc
     except json.JSONDecodeError as exc:
         raise PackExportError(f"{path} is not valid JSON: {exc}") from exc
+    except OSError as exc:
+        # An unreadable manifest is an operator problem like any other -- it must
+        # reach the CLI as a clean "check failed", not as a traceback.
+        raise PackExportError(f"{path} could not be read: {exc}") from exc
 
 
 def pack_dirs(dest: Path) -> list[str]:
@@ -330,10 +373,20 @@ def pack_dirs(dest: Path) -> list[str]:
     Mirrors ``SidebuttonAgent.pack_skill_dirs``: every non-hidden subdirectory is
     a pack the adapter would stage — so the drift guard must see them all, not
     only the ones matching :data:`PACK_GLOB`.
+
+    Symlinks are excluded on purpose. A link is never a pack (the export refuses
+    to write one), and treating it as one would make every walker built on this
+    function follow it *out* of ``packs/`` — the drift guard would then enumerate
+    whatever ``sb-tb-x -> /etc`` points at. The checker reports links separately,
+    so excluding them here loses no coverage.
     """
     if not dest.is_dir():
         return []
-    return sorted(p.name for p in dest.iterdir() if p.is_dir() and not p.name.startswith("."))
+    return sorted(
+        p.name
+        for p in dest.iterdir()
+        if p.is_dir() and not p.is_symlink() and not p.name.startswith(".")
+    )
 
 
 def stale_export_entries(dest: Path) -> list[Path]:
@@ -358,6 +411,31 @@ def default_dest() -> Path:
     return Path(__file__).resolve().parent / "packs"
 
 
+def _assert_mirrorable(dest: Path) -> None:
+    """Refuse to mirror into a directory that is not an export destination.
+
+    The mirror write removes *every* pack subdirectory of ``dest`` — including
+    ones the export could not have produced, which is deliberate (a hand-added
+    dir is drift). That makes a mistyped ``--dest`` destructive: pointed one
+    level too high it would delete ``config/`` and every other subpackage. An
+    absent or empty directory is fine, and so is one already carrying the
+    adapter's loose files, which is what ``packs/`` always looks like.
+    """
+    if dest.exists() and not dest.is_dir():
+        raise PackExportError(f"destination exists and is not a directory: {dest}")
+    if not dest.is_dir():
+        return
+    entries = list(dest.iterdir())
+    if not entries or any(entry.name in MIRROR_SENTINELS for entry in entries):
+        return
+    raise PackExportError(
+        f"refusing to mirror into {dest}: it is not empty and holds neither "
+        f"{MANIFEST_NAME} nor README.md, so it does not look like a packs "
+        "directory — check --dest (the bundled one is "
+        "src/sidebutton_harbor_agent/packs)"
+    )
+
+
 def export_packs(
     *,
     source: Path,
@@ -377,6 +455,7 @@ def export_packs(
     complete, so a failure leaves ``dest`` exactly as it was.
     """
     dest = dest or default_dest()
+    _assert_mirrorable(dest)
     sha = resolve_commit(source, ref)
     packs = discover_packs(source, sha, glob)
     if not packs:

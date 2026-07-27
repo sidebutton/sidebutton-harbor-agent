@@ -205,9 +205,13 @@ the packs have to ship inside this repo. The flow is strictly one-way: this repo
 # 1. Export (operator, from a read-only checkout of the account pack repo)
 sidebutton-harbor-agent-export-packs --source ../pack-repo --commit <sha>
 
-# 2. Verify, then commit packs/ + packs/EXPORT.json
-sidebutton-harbor-agent-check-packs
+# 2. Verify against the source you exported from, then commit packs/ + packs/EXPORT.json
+sidebutton-harbor-agent-check-packs --source ../pack-repo
 ```
+
+Pass `--source` at this step. Bare `check-packs` re-hashes the files the export just wrote against
+the manifest the same run just wrote, so straight after an export it can only report pre-existing
+junk in `packs/` — it is the mode CI runs *without a credential*, not a check of the export itself.
 
 The export reads the **committed** tree (`git archive` at the pinned commit), so a dirty checkout
 cannot leak uncommitted content into a public repo, and it selects exactly the top-level `sb-tb-*`
@@ -232,13 +236,24 @@ total.
   "source_commit": "<full 40-hex sha>",
   "source_commit_date": "2026-07-27T12:00:00+00:00",
   "export_date": "2026-07-27T16:40:00Z",
+  "pack_glob": "sb-tb-*",
   "packs": ["sb-tb-algo", "sb-tb-build", "..."],
   "files": { "sb-tb-algo/_skill.md": "<sha256>", "...": "..." }
 }
 ```
 
+Those eight keys are the whole schema — the checker rejects a manifest that is missing one or
+carries an extra, since `packs/` ships into the task container wholesale and an unknown key would be
+an unreviewed text channel into it.
+
 `EXPORT.json` is a loose file, so the adapter's loader ignores it (only subdirectories are packs).
-Set `SOURCE_DATE_EPOCH` to pin `export_date` when reproducing an export byte-for-byte.
+Set `SOURCE_DATE_EPOCH` to pin `export_date` when reproducing an export byte-for-byte. The export
+also forces `core.autocrlf=false` / `core.eol=lf` on every git call, so the operator's own git
+configuration cannot change the exported bytes.
+
+`--dest` defaults to the *installed* `packs/`, so run the export from an editable checkout
+(`pip install -e .`) — under a plain `pip install` the default writes into `site-packages`, where
+there is nothing to commit. The tool prints the `dest:` it used.
 
 ### Drift guard modes
 
@@ -247,17 +262,25 @@ degrades cleanly, because the private-repo fetch is credential-gated. It always 
 
 | Mode | Needs | Catches |
 |---|---|---|
-| **offline** (default) | nothing | hand-edited, added or deleted files under `packs/`; pack list ≠ manifest; missing or malformed manifest; a short (ambiguous) `source_commit` |
-| **full** (`--source <checkout>` or `--fetch`) | a checkout, or `SB_PACK_REPO_TOKEN` (+ `SB_PACK_REPO_URL`) | everything above **plus** a *coordinated* edit where the file and its recorded hash were changed together, and packs re-synced from a newer commit without moving the pin |
+| **offline** (default) | nothing | hand-edited, added or deleted files under `packs/`; pack list ≠ manifest; missing, malformed or extra-keyed manifest; a short (ambiguous) `source_commit`; a link, a hidden or empty directory, an unexported loose file, or an unsafe permission bit anywhere under `packs/` |
+| **full** (`--source <checkout>` or `--fetch`) | a checkout, or `SB_PACK_REPO_URL` + `SB_PACK_REPO_TOKEN` | everything above **plus** a *coordinated* edit where the file and its recorded hash were changed together, a mode-only edit, and packs re-synced from a newer commit without moving the pin |
 
 Offline mode cannot see a coordinated file+hash tamper — its hashes are self-referential by
 construction. That is what the credentialed mode is for; configure the secret where the full check
-matters. The cold state (no packs, no manifest) is valid and passes.
+matters. The cold state (no packs, no manifest) is valid and passes — which also means the job is
+green-by-vacuity until the first real export lands.
 
 `--fetch` clones the pack repo read-only into a temp dir using `SB_PACK_REPO_TOKEN`, passed via
 `GIT_ASKPASS` so it never reaches the command line or the clone's config, and redacted from output.
-Credentials are also stripped from any URL recorded in the manifest. The tool shells out to `git`
-(present on GitHub runners).
+Credentials are also stripped from any URL recorded in the manifest.
+
+**When a token is configured, `SB_PACK_REPO_URL` is required.** `source_repo` in `EXPORT.json` is
+repo-controlled data — a one-line change to a committed file — so falling back to it would let a
+pull request point the read credential at a host of its author's choosing, and then produce a green
+`full (fetch …)` verdict against a repo that author also populated. The URL a credential is sent to
+comes from the operator or not at all; without a token the recorded URL is still used as a default.
+A credential is never sent over cleartext `http://`. The tool shells out to `git` (present on GitHub
+runners).
 
 **Cold arm, once packs are bundled.** `has_packs()` is a property of the packs directory, so after an
 export the default is *primed*. A cold arm then passes an explicit empty directory:
@@ -278,8 +301,9 @@ harbor run --agent sidebutton_harbor_agent:SidebuttonAgent --agent-kwarg packs_d
 - **Robustness.** A pack-layer failure degrades to the base agent rather than erroring the trial —
   a flaky layer must never cost a reward.
 - **Pinned & recorded.** `version()` reports `<adapter>+cli.<sidebutton-cli-version>`; the packs'
-  export commit is recorded in `packs/EXPORT.json` **and** per benchmark arm, and CI fails on drift
-  between the two, so any run is re-creatable.
+  export commit is recorded in `packs/EXPORT.json`, and CI fails when `packs/` drifts from it, so any
+  run is re-creatable. Copying that `source_commit` into an arm's `pack_repo_commit` is an operator
+  step — the arm's parameter block lives outside this repo, so nothing here can check it.
 
 ## Development
 

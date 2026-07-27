@@ -8,9 +8,12 @@
 #
 # OPTIONAL SECRETS (the `packs` job below):
 #   SB_PACK_REPO_TOKEN — read credential for the private account pack repo.
-#   SB_PACK_REPO_URL   — its clone URL (defaults to the manifest's source_repo).
+#   SB_PACK_REPO_URL   — its https clone URL. REQUIRED whenever the token is set:
+#                        the drift guard refuses to send a credential to the URL
+#                        recorded in packs/EXPORT.json, since that file is
+#                        repo-controlled and a PR could redirect the secret.
 # Both unset is a supported configuration: the drift guard then runs its
-# credential-less mode. Setting them upgrades it to the full re-export diff.
+# credential-less mode. Setting both upgrades it to the full re-export diff.
 
 name: CI
 
@@ -78,7 +81,11 @@ jobs:
           SB_PACK_REPO_URL: ${{ secrets.SB_PACK_REPO_URL }}
           SB_PACK_REPO_TOKEN: ${{ secrets.SB_PACK_REPO_TOKEN }}
         run: |
-          if [ -n "$SB_PACK_REPO_TOKEN" ]; then
+          if [ -n "$SB_PACK_REPO_TOKEN" ] && [ -z "$SB_PACK_REPO_URL" ]; then
+            echo "SB_PACK_REPO_TOKEN is set but SB_PACK_REPO_URL is not — the guard"
+            echo "will not send a credential to a URL read out of packs/EXPORT.json."
+            exit 1
+          elif [ -n "$SB_PACK_REPO_TOKEN" ]; then
             echo "read credential configured -> full drift check (re-export at the recorded commit)"
             sidebutton-harbor-agent-check-packs --fetch
           else
