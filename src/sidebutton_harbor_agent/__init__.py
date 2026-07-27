@@ -11,10 +11,10 @@ from sidebutton_harbor_agent.agent import (
 )
 
 __all__ = [
-    "SidebuttonAgent",
-    "InContainerInvocation",
     "ADAPTER_VERSION",
     "DEFAULT_SIDEBUTTON_CLI_VERSION",
+    "InContainerInvocation",
+    "SidebuttonAgent",
 ]
 
 __version__ = ADAPTER_VERSION
