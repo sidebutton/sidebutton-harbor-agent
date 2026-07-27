@@ -15,3 +15,9 @@ venv/
 .ruff_cache/
 .coverage
 htmlcov/
+
+# Smoke-run artifacts (see "Smoke run" in the README): harbor writes trials under
+# ./jobs and downloads the dataset into ./<dataset-name>. Both are large and
+# neither belongs in the repo.
+jobs/
+terminal-bench-2-1/

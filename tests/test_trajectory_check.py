@@ -287,6 +287,250 @@ def test_cli_exit_codes_and_json(tmp_path: Path, capsys) -> None:
     assert payload[0]["verification_step_ids"] == [3]
 
 
+def _multi_step(
+    step_id: int,
+    message: str,
+    calls: list[tuple[str, dict[str, Any], str | None]],
+) -> Step:
+    """One ATIF turn carrying several tool calls, as harbor emits them.
+
+    Harbor bundles every ``tool_use`` of one LLM inference into a single step
+    (RFC-0001), so "fix it and re-run the check" arrives as one step with an
+    ``Edit`` followed by a ``Bash`` — not as two steps.
+    """
+    tool_calls = [
+        ToolCall(tool_call_id=f"call-{step_id}-{i}", function_name=name, arguments=args)
+        for i, (name, args, _) in enumerate(calls)
+    ]
+    results = [
+        ObservationResult(source_call_id=f"call-{step_id}-{i}", content=output)
+        for i, (_, _, output) in enumerate(calls)
+        if output is not None
+    ]
+    return Step(
+        step_id=step_id,
+        source="agent",
+        message=message,
+        tool_calls=tool_calls,
+        observation=Observation(results=results) if results else None,
+    )
+
+
+def test_stderr_redirect_is_not_an_edit(tmp_path: Path) -> None:
+    """``2>&1`` is fd plumbing, not a write.
+
+    The bare redirect branch used to match it, so `pytest -q 2>&1 | tail` — the
+    most common verification idiom there is — was scored as the last edit and a
+    healthy self-review turn was reported as a FAIL.
+    """
+    path = _write(
+        tmp_path,
+        _edit(1),
+        _step(2, "Re-reading the task: 3 acceptance criteria."),
+        _step(
+            3,
+            "Running the suite.",
+            tool="Bash",
+            arguments={"command": "python3 -m pytest -q 2>&1 | tail -5"},
+            output="3 passed",
+        ),
+    )
+    report = analyze_trajectory(path)
+
+    assert report.last_mutation_step_id == 1
+    assert report.verification_step_ids == [3]
+    assert report.self_review_turn_present
+
+
+def test_check_batched_into_the_editing_turn_counts(tmp_path: Path) -> None:
+    """A turn that edits and then re-runs the check verifies the shipped code."""
+    path = _write(
+        tmp_path,
+        _step(1, "Reading.", tool="Read", arguments={"file_path": "/app/s.py"}, output="..."),
+        _multi_step(
+            2,
+            "Re-reading each acceptance criterion; fixing the off-by-one and re-running.",
+            [
+                ("Edit", {"file_path": "/app/s.py"}, "File updated."),
+                ("Bash", {"command": "python -m pytest -q"}, "3 passed"),
+            ],
+        ),
+    )
+    report = analyze_trajectory(path)
+
+    assert report.last_mutation_step_id == 2
+    assert report.verification_step_ids == [2]
+    assert report.criteria_step_ids == [2]
+    assert report.self_review_turn_present
+
+
+def test_check_before_the_edit_inside_one_turn_does_not_count(tmp_path: Path) -> None:
+    """Call order inside the turn decides: a check that ran *before* the edit in
+    the same step never exercised the shipped code."""
+    path = _write(
+        tmp_path,
+        _multi_step(
+            1,
+            "Checking the criteria, then patching what failed.",
+            [
+                ("Bash", {"command": "python -m pytest -q"}, "1 failed"),
+                ("Edit", {"file_path": "/app/s.py"}, "File updated."),
+            ],
+        ),
+        _step(2, "That should do it. Done."),
+    )
+    report = analyze_trajectory(path)
+
+    assert report.last_mutation_step_id == 1
+    assert report.verification_step_ids == []
+    assert not report.self_review_turn_present
+
+
+def test_agent_bookkeeping_tools_are_not_verification(tmp_path: Path) -> None:
+    """The near-miss this tool exists to catch, in its most common disguise:
+    ``TodoWrite`` returns output but observes nothing about the container."""
+    path = _write(
+        tmp_path,
+        _edit(1),
+        _step(
+            2,
+            "Marking the checklist done.",
+            tool="TodoWrite",
+            arguments={"todos": []},
+            output="Todos have been modified successfully.",
+        ),
+        _step(3, "Every requirement is satisfied by the change. Done."),
+    )
+    report = analyze_trajectory(path)
+
+    assert report.verification_step_ids == []
+    assert not report.self_review_turn_present
+
+
+def test_quiet_check_with_empty_output_counts_as_observed(tmp_path: Path) -> None:
+    """Silence is success for ``diff``/``cmp``/``grep -q``/``test`` — harbor only
+    emits a result when the tool returned, so ``""`` means "ran and printed
+    nothing", not "never ran"."""
+    path = _write(
+        tmp_path,
+        _edit(1),
+        _step(2, "Re-reading each requirement."),
+        _step(
+            3,
+            "Comparing against the expected output.",
+            tool="Bash",
+            arguments={"command": "diff /app/out.txt /app/expected.txt"},
+            output="",
+        ),
+    )
+    report = analyze_trajectory(path)
+
+    assert report.verification_step_ids == [3]
+    assert report.self_review_turn_present
+
+
+def test_output_flag_write_is_an_edit(tmp_path: Path) -> None:
+    """A file created via an output *flag* rather than a redirect is still an
+    edit — otherwise a rewrite after the check widens the window and the shipped
+    artifact is never verified. ``openssl -out`` is the shape the flagship smoke
+    task (``openssl-selfsigned-cert``) produces."""
+    path = _write(
+        tmp_path,
+        _step(
+            1,
+            "Checking the 6 acceptance criteria.",
+            tool="Bash",
+            arguments={"command": "openssl x509 -in /app/cert.pem -noout -subject"},
+            output="subject=CN=example.com",
+        ),
+        _step(
+            2,
+            "Validity is wrong, regenerating the certificate.",
+            tool="Bash",
+            arguments={
+                "command": (
+                    "openssl req -x509 -newkey rsa:4096 -keyout /app/key.pem "
+                    "-out /app/cert.pem -nodes -days 365 -subj '/CN=example.com'"
+                )
+            },
+            output="writing new private key to '/app/key.pem'",
+        ),
+        _step(3, "Done."),
+    )
+    report = analyze_trajectory(path)
+
+    assert report.last_mutation_step_id == 2
+    assert not report.self_review_turn_present
+
+
+def test_dependency_chatter_is_not_a_criteria_restatement(tmp_path: Path) -> None:
+    """Cues match whole words: ``requirements.txt`` is not a self-review, and the
+    excerpt attached as AC3 evidence must not be a pip line."""
+    path = _write(
+        tmp_path,
+        _edit(1),
+        _step(
+            2,
+            "Installing dependencies from requirements.txt now.",
+            tool="Bash",
+            arguments={"command": "cat /app/requirements.txt"},
+            output="numpy==2.1.0",
+        ),
+    )
+    report = analyze_trajectory(path)
+
+    assert report.criteria_step_ids == []
+    assert not report.self_review_turn_present
+    assert report.excerpt == ""
+
+
+def test_malformed_steps_report_an_error_not_a_traceback(tmp_path: Path) -> None:
+    """A steps array holding no objects used to reach ``max()`` on an empty
+    sequence, aborting a whole job sweep with a traceback."""
+    broken = tmp_path / "trajectory.json"
+    broken.write_text(json.dumps({"steps": ["oops", None]}), encoding="utf-8")
+
+    report = analyze_trajectory(broken)
+
+    assert not report.self_review_turn_present
+    assert "no object-shaped steps" in report.error
+
+
+def test_missing_target_does_not_swallow_the_others(tmp_path: Path, capsys) -> None:
+    """One errored trial with no trajectory must not hide the trials named after
+    it — an operator would read the run as "checked"."""
+    good = _write(
+        tmp_path,
+        _edit(1),
+        _step(2, "Re-reading the criteria."),
+        _step(3, "Check.", tool="Bash", arguments={"command": "ls /app"}, output="ok"),
+        name="good.json",
+    )
+
+    exit_code = main([str(tmp_path / "nope"), str(good)])
+    captured = capsys.readouterr()
+
+    assert exit_code == 1  # missing evidence never reads as clean
+    assert "no trajectory.json found under" in captured.err
+    assert "PASS" in captured.out
+
+
+def test_excerpt_can_be_suppressed(tmp_path: Path, capsys) -> None:
+    """``--excerpt-chars 0`` means no excerpt, as the help text promises."""
+    path = _write(
+        tmp_path,
+        _edit(1),
+        _step(2, "Re-reading the criteria."),
+        _step(3, "Check.", tool="Bash", arguments={"command": "ls /app"}, output="ok"),
+    )
+
+    assert main([str(path), "--excerpt-chars", "0"]) == 0
+    captured = capsys.readouterr()
+
+    assert "self-review excerpt" not in captured.out
+    assert "…" not in captured.out
+
+
 def test_documented_smoke_tasks_are_a_small_named_set() -> None:
     """AC3 asks for 2-3 sample tasks; the ids are pinned here as the doc's source
     of truth (``tests/test_docs.py`` checks the README against them)."""

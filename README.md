@@ -137,8 +137,9 @@ Notes on the invocation:
   [`trajectory_check.py`](src/sidebutton_harbor_agent/trajectory_check.py), pinned by
   `tests/test_docs.py`). They are criteria-dense — each instruction states requirements the
   self-review turn can be seen enumerating — and `modernize-scientific-stack` is failure-shaped, so
-  it also exercises the reproduce-before-fix pillar. Confirm any substitute with
-  `harbor datasets download terminal-bench/terminal-bench-2-1` first.
+  it also exercises the reproduce-before-fix pillar. To substitute one, confirm it exists with
+  `harbor datasets download terminal-bench/terminal-bench-2-1` **and** update `SMOKE_TASK_NAMES` —
+  the README and that constant are pinned to each other, so changing only one fails the test.
 - One run over three repeated `--include-task-name` flags (the RUNBOOK's subset-iteration form) puts
   all trials under one job directory, so the check below covers them in one pass. `--n-concurrent 1`
   serializes the image pulls for a small VM; raise it if disk and CPU allow.

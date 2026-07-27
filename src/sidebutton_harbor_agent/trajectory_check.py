@@ -18,6 +18,17 @@ tool-call heuristics over free-form agent text, so the command always prints the
 excerpt it matched. Attach the excerpt as the evidence; use the exit code to
 catch the obvious miss (agent edited, then declared done without running
 anything).
+
+Two properties the heuristics are deliberately built around, because getting
+either wrong inverts the verdict on a real run:
+
+* **A step is a turn, not an action.** Harbor bundles every ``tool_use`` of one
+  LLM inference into a single ATIF step (RFC-0001), so the common "fix it and
+  re-run the check" turn is *one* step holding both. Mutation and verification
+  are therefore resolved per tool call, in call order, not per step.
+* **Shell text is matched, not parsed.** An over-match narrows the window and
+  fails a healthy trajectory; a missed form widens it and passes a lazy one.
+  Neither direction is safe, which is why the excerpt is always printed.
 """
 
 from __future__ import annotations
@@ -64,9 +75,26 @@ MUTATION_TOOLS = frozenset(
     }
 )
 
+#: Tools that return output but observe nothing about the container: they report
+#: on the agent's own bookkeeping or the network. Running one after an edit is
+#: *not* "run the thing and read the output", so they never satisfy the
+#: verification signal. ``TodoWrite`` in particular closes almost every Claude
+#: Code task, and counting it would pass the exact miss this tool exists to catch.
+NON_OBSERVING_TOOLS = frozenset(
+    {
+        "todowrite",
+        "todoread",
+        "exitplanmode",
+        "websearch",
+        "webfetch",
+    }
+)
+
 #: Shell fragments that make a command a mutation rather than an observation.
-#: Deliberately short and readable — the goal is to find the *last* edit, so a
-#: missed exotic form only shifts the window earlier (a conservative verdict).
+#: Deliberately short and readable — this cannot be a shell parser, and it errs
+#: in both directions: a missed form widens the self-review window (a lenient
+#: verdict), an over-match narrows it (a false FAIL). Both are why the command
+#: always prints the excerpt and the docs call the verdict a signal.
 _MUTATING_SHELL_RE = re.compile(
     r"""(?:\btee\b
       | \bsed\s+-i
@@ -74,15 +102,28 @@ _MUTATING_SHELL_RE = re.compile(
       | \bpatch\b
       | \bgit\s+(?:commit|apply|am|checkout|switch|merge|cherry-pick|reset|revert|stash)\b
       | \b(?:pip|pip3|npm|apt-get|apk|dnf|yum)\s+(?:install|i|add)\b
+      | \b(?:curl|wget)\b[^|;&]*\s-(?:o|O|-output)\b
+      | \bopenssl\b[^|;&]*\s-(?:out|keyout)\b
+      | \b(?:unzip|gunzip|bunzip2)\b
+      | \bmake\b[^|;&]*\binstall\b
       | >>?)""",
     re.VERBOSE,
 )
+
+#: File-descriptor duplication (``2>&1``, ``>&2``, ``1>&-``). Plumbing, not a
+#: write — but the ``>>?`` branch above would read it as a redirect, which turned
+#: `pytest -q 2>&1 | tail` (the most common verification idiom there is) into an
+#: "edit" and reported a healthy self-review turn as a FAIL. Stripped first.
+#: The digit/``-`` requirement keeps the rare `cmd >& file` form a mutation.
+_FD_DUP_RE = re.compile(r"\d*>&\s*(?:\d+|-)")
 
 #: Redirect targets that do not count as mutating the solution (scratch output).
 _SCRATCH_REDIRECT_RE = re.compile(r">>?\s*(?:/dev/null|/tmp/|\S*\.log\b)")
 
 #: Cues that an agent turn is enumerating what the task asked for, rather than
-#: narrating an edit. Matched case-insensitively against message + reasoning.
+#: narrating an edit. Matched case-insensitively against message + reasoning as
+#: whole words, so ``requirements.txt`` (dependency chatter, not a criteria
+#: restatement) no longer counts as a self-review.
 CRITERIA_CUES = (
     "acceptance crit",
     "criterion",
@@ -97,6 +138,14 @@ CRITERIA_CUES = (
     "the instruction",
     "each item",
     "every item",
+)
+
+#: ``CRITERIA_CUES`` as one word-boundary alternation. The trailing guard stops a
+#: cue from matching the start of a filename (``requirements.txt``,
+#: ``criteria.json``) while still allowing normal prose punctuation.
+_CRITERIA_CUE_RE = re.compile(
+    r"\b(?:{})\w*\b(?!\.\w)".format("|".join(re.escape(cue) for cue in CRITERIA_CUES)),
+    re.IGNORECASE,
 )
 
 
@@ -153,7 +202,7 @@ class TrajectoryReport:
             # the operator can lift the fullest excerpt from the trajectory.
             f"  restated task criteria anywhere: {self.criteria_step_ids_any or '(none)'}",
         ]
-        if self.excerpt:
+        if self.excerpt and excerpt_chars > 0:
             body = self.excerpt[:excerpt_chars]
             suffix = "…" if len(self.excerpt) > excerpt_chars else ""
             lines.append("  self-review excerpt:")
@@ -189,36 +238,76 @@ def _command_text(call: dict[str, Any]) -> str:
     return "\n".join(v for v in values if isinstance(v, str))
 
 
+def _tool_name(call: dict[str, Any]) -> str:
+    return (call.get("function_name") or "").strip().lower()
+
+
+def _call_is_mutation(call: dict[str, Any]) -> bool:
+    """One tool call changes the container."""
+    if _tool_name(call) in MUTATION_TOOLS:
+        return True
+    command = _command_text(call)
+    if not command:
+        return False
+    scrubbed = _SCRATCH_REDIRECT_RE.sub("", _FD_DUP_RE.sub("", command))
+    return bool(_MUTATING_SHELL_RE.search(scrubbed))
+
+
+def _last_mutation_index(step: dict[str, Any]) -> int:
+    """Index of the step's last mutating tool call, or -1 if it has none."""
+    return max(
+        (i for i, call in enumerate(_tool_calls(step)) if _call_is_mutation(call)),
+        default=-1,
+    )
+
+
 def _is_mutation(step: dict[str, Any]) -> bool:
-    for call in _tool_calls(step):
-        if (call.get("function_name") or "").strip().lower() in MUTATION_TOOLS:
-            return True
-        command = _command_text(call)
-        if command and _MUTATING_SHELL_RE.search(
-            _SCRATCH_REDIRECT_RE.sub("", command)
-        ):
+    return _last_mutation_index(step) >= 0
+
+
+def _observed_call_ids(step: dict[str, Any]) -> set[str]:
+    """Ids of the calls the environment actually answered.
+
+    ``content`` is compared against ``None``, not truthiness: harbor only emits a
+    result when the tool returned, so ``""`` means "ran and printed nothing" —
+    which is success for ``diff``, ``cmp``, ``grep -q`` and ``test``, i.e. the
+    most rigorous checks an agent can run.
+    """
+    results = ((step.get("observation") or {}).get("results")) or []
+    return {
+        r.get("source_call_id")
+        for r in results
+        if isinstance(r, dict) and r.get("content") is not None
+    }
+
+
+def _observed_output(step: dict[str, Any]) -> bool:
+    """The step ran a check against the container *after* its own last edit and
+    the environment's result came back.
+
+    This is the "run the thing, don't assert" signal. Two things it deliberately
+    does not accept: a claim of success with no observed output, and a tool that
+    reports only on the agent's own state (:data:`NON_OBSERVING_TOOLS`).
+
+    Resolution is per tool call, not per step, because harbor bundles every
+    ``tool_use`` of one LLM turn into a single ATIF step (RFC-0001: "``step`` ==
+    one turn; ``tool_calls`` is multi-valued"). A turn that batches an edit with
+    the re-run of the check is the most common Claude Code shape there is, so the
+    check that follows the edit *within* the same step has to count.
+    """
+    observed = _observed_call_ids(step)
+    calls = _tool_calls(step)
+    for call in calls[_last_mutation_index(step) + 1 :]:
+        name = _tool_name(call)
+        if name in MUTATION_TOOLS or name in NON_OBSERVING_TOOLS:
+            continue
+        if call.get("tool_call_id") in observed:
             return True
     return False
 
 
-def _observed_output(step: dict[str, Any]) -> bool:
-    """The step ran a non-mutating tool and the environment's result came back.
-
-    This is the "run the thing, don't assert" signal: a claim of success with no
-    observed output does not count.
-    """
-    results = ((step.get("observation") or {}).get("results")) or []
-    if not any(r.get("content") for r in results if isinstance(r, dict)):
-        return False
-    return any(
-        (call.get("function_name") or "").strip().lower() not in MUTATION_TOOLS
-        for call in _tool_calls(step)
-    )
-
-
 def _mentions_criteria(text: str) -> bool:
-    lowered = text.lower()
-    return any(cue in lowered for cue in CRITERIA_CUES)
+    return bool(_CRITERIA_CUE_RE.search(text))
 
 
 def analyze_trajectory(path: Path) -> TrajectoryReport:
@@ -235,14 +324,19 @@ def analyze_trajectory(path: Path) -> TrajectoryReport:
         return report
 
     steps = [s for s in steps if isinstance(s, dict)]
+    if not steps:
+        report.error = "no object-shaped steps in trajectory (not an ATIF document?)"
+        return report
     report.steps = len(steps)
     report.final_step_id = max((s.get("step_id") or 0) for s in steps)
     report.last_mutation_step_id = max(
         (s.get("step_id") or 0 for s in steps if _is_mutation(s)), default=0
     )
 
-    # The self-review window: agent turns strictly after the last edit. A check
-    # that ran *before* the final edit does not verify the code that shipped.
+    # The self-review window: agent turns from the last edit onward. A check that
+    # ran *before* the final edit does not verify the code that shipped — but the
+    # editing turn itself is in the window, because a single ATIF step can carry
+    # the edit and the re-run of the check (see :func:`_observed_output`).
     excerpts: list[str] = []
     for step in steps:
         step_id = step.get("step_id") or 0
@@ -252,11 +346,14 @@ def analyze_trajectory(path: Path) -> TrajectoryReport:
         mentions_criteria = _mentions_criteria(text)
         if mentions_criteria:
             report.criteria_step_ids_any.append(step_id)
-        if step_id <= report.last_mutation_step_id:
+        if step_id < report.last_mutation_step_id:
             continue
-        if _observed_output(step):
+        verified = _observed_output(step)
+        if verified:
             report.verification_step_ids.append(step_id)
-        if mentions_criteria:
+        # On the editing turn itself, only prose that accompanies a real
+        # post-edit check is a self-review; otherwise it is narration of the edit.
+        if mentions_criteria and (step_id > report.last_mutation_step_id or verified):
             report.criteria_step_ids.append(step_id)
             if text.strip():
                 excerpts.append(text.strip())
@@ -274,9 +371,9 @@ def find_trajectories(target: Path) -> list[Path]:
         return [target]
     if not target.is_dir():
         return []
-    found = {p for p in target.glob("**/agent/trajectory.json")}
-    found.update(target.glob("**/trajectory.json"))
-    return sorted(found)
+    # ``**/trajectory.json`` already covers ``<trial>/agent/trajectory.json``;
+    # globbing both walked the whole job tree twice for the same result.
+    return sorted(target.glob("**/trajectory.json"))
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -300,7 +397,7 @@ def _build_parser() -> argparse.ArgumentParser:
         "--excerpt-chars",
         type=int,
         default=600,
-        help="Truncate each printed excerpt (default: 600; 0 = no excerpt).",
+        help="Truncate each printed excerpt (default: 600; 0 or less = no excerpt).",
     )
     return parser
 
@@ -308,13 +405,20 @@ def _build_parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     args = _build_parser().parse_args(argv)
 
+    # Every target is resolved before anything is reported, so one errored trial
+    # with no trajectory cannot silently swallow the trials named after it.
     paths: list[Path] = []
+    missing: list[str] = []
     for raw in args.target:
         resolved = find_trajectories(Path(raw))
         if not resolved:
-            print(f"no trajectory.json found under: {raw}", file=sys.stderr)
-            return 2
+            missing.append(raw)
         paths.extend(resolved)
+
+    for raw in missing:
+        print(f"no trajectory.json found under: {raw}", file=sys.stderr)
+    if not paths:
+        return 2
 
     reports = [analyze_trajectory(p) for p in paths]
 
@@ -327,7 +431,7 @@ def main(argv: list[str] | None = None) -> int:
     passed = sum(1 for r in reports if r.self_review_turn_present)
     summary = f"\n{passed}/{len(reports)} trajectory(ies) show a self-review turn."
     print(summary, file=sys.stderr if args.json else sys.stdout)
-    return 0 if passed == len(reports) else 1
+    return 0 if passed == len(reports) and not missing else 1
 
 
 if __name__ == "__main__":  # pragma: no cover
